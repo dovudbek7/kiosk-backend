@@ -13,9 +13,10 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from drf_spectacular.utils import extend_schema, extend_schema_view
 
-from .models import ApplicationTarget, FAQ, FAQCategory, Message
-from .serializers import TargetSerializer, FAQSerializer, FAQCategorySerializer, MessageSerializer
+from .models import ApplicationTarget, FAQ, FAQCategory, Message, Device
+from .serializers import TargetSerializer, FAQSerializer, FAQCategorySerializer, MessageSerializer, DeviceSerializer
 from . import notifications
+import uuid
 
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
@@ -168,6 +169,49 @@ class RingRespondAPIView(APIView):
         return Response({'ok': True, 'ringId': ringId, 'response': response})
 
 
+class RingTriggerAPIView(APIView):
+    """Trigger a ring notification to a target (for testing purposes)"""
+    permission_classes = [permissions.IsAuthenticated]
+
+    @extend_schema(
+        description="Trigger a ring notification to a specific target user",
+        request={
+            'type': 'object',
+            'properties': {
+                'targetId': {'type': 'integer', 'description': 'ID of the target user to ring'},
+                'callerName': {'type': 'string', 'description': 'Name of the caller'},
+                'message': {'type': 'string', 'description': 'Optional message'},
+            },
+            'required': ['targetId']
+        },
+        responses={200: {'type': 'object', 'properties': {'ok': {'type': 'boolean'}, 'ringId': {'type': 'string'}}}},
+    )
+    def post(self, request):
+        target_id = request.data.get('targetId')
+        caller_name = request.data.get('callerName', 'Reception Visitor')
+        message = request.data.get('message', 'You have a visitor at reception!')
+        
+        if not target_id:
+            return Response({'detail': 'targetId is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            target = ApplicationTarget.objects.get(pk=target_id)
+        except ApplicationTarget.DoesNotExist:
+            return Response({'detail': 'Target not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        ring_id = str(uuid.uuid4())
+        
+        # Publish the ring event to the target user
+        notifications.publish(target.user.id, {
+            'type': 'ring',
+            'ringId': ring_id,
+            'callerName': caller_name,
+            'message': message,
+        })
+        
+        return Response({'ok': True, 'ringId': ring_id})
+
+
 class NotificationsStreamAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -250,3 +294,67 @@ class GeneratePasswordView(APIView):
             return redirect('/admin/api_v1/applicationtarget/')
         
         return Response({'error': 'User not found'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class DeviceViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing FCM devices.
+    
+    - POST /api/v1/devices/ - Register a new device
+    - GET /api/v1/devices/ - List all devices for current user
+    - GET /api/v1/devices/<id>/ - Get device details
+    - PUT /api/v1/devices/<id>/ - Update device
+    - DELETE /api/v1/devices/<id>/ - Delete device
+    """
+    serializer_class = DeviceSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        # Return only devices belonging to the current user
+        return Device.objects.filter(user=self.request.user)
+    
+    def perform_create(self, serializer):
+        # Automatically assign the current user as the device owner
+        serializer.save(user=self.request.user)
+    
+    @extend_schema(
+        summary='Register device',
+        description='Register a new FCM device token for push notifications',
+        request=DeviceSerializer,
+        responses={201: DeviceSerializer}
+    )
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+    
+    @extend_schema(
+        summary='List devices',
+        description='List all registered devices for the authenticated user',
+        responses={200: DeviceSerializer(many=True)}
+    )
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+    
+    @extend_schema(
+        summary='Get device',
+        description='Get details of a specific device',
+        responses={200: DeviceSerializer}
+    )
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+    
+    @extend_schema(
+        summary='Update device',
+        description='Update device information (e.g., toggle active status)',
+        request=DeviceSerializer,
+        responses={200: DeviceSerializer}
+    )
+    def update(self, request, *args, **kwargs):
+        return super().update(request, *args, **kwargs)
+    
+    @extend_schema(
+        summary='Delete device',
+        description='Remove a device registration',
+        responses={204: None}
+    )
+    def destroy(self, request, *args, **kwargs):
+        return super().destroy(request, *args, **kwargs)

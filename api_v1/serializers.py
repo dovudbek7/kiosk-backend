@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from drf_spectacular.utils import extend_schema_field
-from .models import ApplicationTarget, FAQ, FAQCategory, Message
+from .models import ApplicationTarget, FAQ, FAQCategory, Message, Device
 
 class FAQCategorySerializer(serializers.ModelSerializer):
     name = serializers.SerializerMethodField()
@@ -110,3 +110,31 @@ class MessageSerializer(serializers.ModelSerializer):
         if obj.media:
             return request.build_absolute_uri(obj.media.url)
         return None
+
+
+class DeviceSerializer(serializers.ModelSerializer):
+    """Serializer for FCM Device model"""
+    
+    class Meta:
+        model = Device
+        fields = ['id', 'registration_id', 'device_type', 'active', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+    
+    def create(self, validated_data):
+        # If device with same registration_id exists, update it instead of creating
+        registration_id = validated_data.get('registration_id')
+        user = validated_data.get('user')
+        
+        existing_device = Device.objects.filter(
+            registration_id=registration_id,
+            user=user
+        ).first()
+        
+        if existing_device:
+            # Update existing device
+            for key, value in validated_data.items():
+                setattr(existing_device, key, value)
+            existing_device.save()
+            return existing_device
+        
+        return super().create(validated_data)
