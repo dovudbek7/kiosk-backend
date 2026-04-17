@@ -157,6 +157,45 @@ class FAQ(models.Model):
     answer_ru = models.TextField(verbose_name='Javob (Ruscha)')
     answer_en = models.TextField(verbose_name='Javob (Inglizcha)')
 
+class Ring(models.Model):
+    """Persisted ring event for analytics."""
+    class ResponseChoice(models.TextChoices):
+        COMING = 'coming', 'Coming'
+        BUSY = 'busy', 'Busy'
+        DAY_OFF = 'day_off', 'Day off'
+
+    ring_id = models.CharField(max_length=64, unique=True, verbose_name='Ring ID')
+    target = models.ForeignKey(ApplicationTarget, on_delete=models.CASCADE, related_name='rings', verbose_name='Target')
+    caller_name = models.CharField(max_length=255, default='Visitor', verbose_name='Caller name')
+    response = models.CharField(max_length=10, choices=ResponseChoice.choices, blank=True, verbose_name='Response')
+    responded_at = models.DateTimeField(null=True, blank=True, verbose_name='Responded at')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Created at')
+
+    def __str__(self):
+        return f"Ring {self.ring_id[:8]} → {self.target}"
+
+
+class KioskVisit(models.Model):
+    """Tracks each visitor session on the kiosk."""
+    session_id = models.CharField(max_length=64, unique=True, verbose_name='Session ID')
+    language = models.CharField(max_length=5, default='uz', verbose_name='Language')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Visit time')
+
+    def __str__(self):
+        return f"Visit {self.session_id[:8]} ({self.language})"
+
+
+class ServiceRequest(models.Model):
+    """Tracks which target/service a visitor looked at or interacted with."""
+    target = models.ForeignKey(ApplicationTarget, on_delete=models.CASCADE, related_name='service_requests', verbose_name='Target')
+    visit = models.ForeignKey(KioskVisit, on_delete=models.SET_NULL, null=True, blank=True, related_name='service_requests')
+    action = models.CharField(max_length=20, default='view', verbose_name='Action')  # view, ring, message
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Time')
+
+    def __str__(self):
+        return f"{self.action} → {self.target} at {self.created_at}"
+
+
 class Message(models.Model):
     class MessageType(models.TextChoices):
         TEXT = 'text', 'Matn'
@@ -207,3 +246,17 @@ def emit_message_event(sender, instance, created, **kwargs):
             publish(instance.target.id, event)
         except Exception:
             pass
+
+        # Send FCM push notification
+        try:
+            from .fcm_service import send_message_notification
+            send_message_notification(
+                user=instance.target,
+                sender_name=instance.sender_name,
+                content=instance.content or '',
+                message_id=instance.id,
+                message_type=instance.type,
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception('FCM push failed for message %s', instance.id)

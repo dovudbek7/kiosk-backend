@@ -1,6 +1,6 @@
 from django.core.management.base import BaseCommand
 from django.contrib.auth.models import User
-from api_v1.models import ApplicationTarget, Message
+from api_v1.models import ApplicationTarget, Message, FAQCategory, FAQ, Ring, KioskVisit, ServiceRequest
 from django.core.files import File
 import os
 from datetime import timedelta, time
@@ -386,3 +386,217 @@ class Command(BaseCommand):
                 self.stdout.write(f'Created {len(messages_data[i])} messages for {target.user.get_full_name()}')
 
         self.stdout.write(self.style.SUCCESS(f'Successfully created {len(fake_targets_data)} fake targets with messages'))
+
+        # ── FAQ Categories & FAQs ──
+        FAQCategory.objects.all().delete()
+        self.stdout.write('Deleted existing FAQ categories and FAQs')
+
+        faq_categories_data = [
+            {
+                'name_uz': 'Umumiy savollar',
+                'name_kr': 'Umumiy savollar',
+                'name_ru': 'Общие вопросы',
+                'name_en': 'General Questions',
+                'faqs': [
+                    {
+                        'question_uz': 'Kiosk qanday ishlaydi?',
+                        'question_kr': 'Kiosk qanday ishlaydi?',
+                        'question_ru': 'Как работает киоск?',
+                        'question_en': 'How does the kiosk work?',
+                        'answer_uz': 'Kiosk orqali siz xodimlarni qidirishingiz, ularga xabar yuborishingiz yoki qo\'ng\'iroq qilishingiz mumkin.',
+                        'answer_kr': 'Kiosk arqali siz xodimlarni qidirishingiz, ularga xabar yuborishingiz yoki qo\'ng\'iroq qilishingiz mumkin.',
+                        'answer_ru': 'Через киоск вы можете искать сотрудников, отправлять им сообщения или звонить.',
+                        'answer_en': 'Through the kiosk you can search for employees, send them messages, or make calls.',
+                    },
+                    {
+                        'question_uz': 'Kiosk qaysi tillarda ishlaydi?',
+                        'question_kr': 'Kiosk qaysi tillarda ishlaydi?',
+                        'question_ru': 'На каких языках работает киоск?',
+                        'question_en': 'What languages does the kiosk support?',
+                        'answer_uz': 'Kiosk o\'zbek, qoraqalpoq, rus va ingliz tillarida ishlaydi.',
+                        'answer_kr': 'Kiosk o\'zbek, qoraqalpoq, rus va ingliz tillarida ishlaydi.',
+                        'answer_ru': 'Киоск работает на узбекском, каракалпакском, русском и английском языках.',
+                        'answer_en': 'The kiosk supports Uzbek, Karakalpak, Russian, and English languages.',
+                    },
+                ],
+            },
+            {
+                'name_uz': 'Xabar yuborish',
+                'name_kr': 'Xabar jiberiu',
+                'name_ru': 'Отправка сообщений',
+                'name_en': 'Sending Messages',
+                'faqs': [
+                    {
+                        'question_uz': 'Xodimga qanday xabar yuboraman?',
+                        'question_kr': 'Xodimga qanday xabar jiberemen?',
+                        'question_ru': 'Как отправить сообщение сотруднику?',
+                        'question_en': 'How do I send a message to an employee?',
+                        'answer_uz': 'Xodimni qidiring, uning profilini oching va "Xabar yuborish" tugmasini bosing.',
+                        'answer_kr': 'Xodimni qidiring, uning profilini oching va "Xabar jiberiu" tugmasini bosing.',
+                        'answer_ru': 'Найдите сотрудника, откройте его профиль и нажмите кнопку "Отправить сообщение".',
+                        'answer_en': 'Search for the employee, open their profile, and tap the "Send Message" button.',
+                    },
+                    {
+                        'question_uz': 'Audio xabar yuborish mumkinmi?',
+                        'question_kr': 'Audio xabar jiberiu mumkinba?',
+                        'question_ru': 'Можно ли отправить аудиосообщение?',
+                        'question_en': 'Can I send an audio message?',
+                        'answer_uz': 'Ha, siz matn, audio va video xabar yuborishingiz mumkin.',
+                        'answer_kr': 'Ha, siz matn, audio va video xabar jiberiu mumkinsiz.',
+                        'answer_ru': 'Да, вы можете отправлять текстовые, аудио и видео сообщения.',
+                        'answer_en': 'Yes, you can send text, audio, and video messages.',
+                    },
+                ],
+            },
+            {
+                'name_uz': 'Qo\'ng\'iroq qilish',
+                'name_kr': 'Qo\'ng\'iroq qiliu',
+                'name_ru': 'Звонки',
+                'name_en': 'Making Calls',
+                'faqs': [
+                    {
+                        'question_uz': 'Xodimga qanday qo\'ng\'iroq qilaman?',
+                        'question_kr': 'Xodimga qanday qo\'ng\'iroq qilaman?',
+                        'question_ru': 'Как позвонить сотруднику?',
+                        'question_en': 'How do I call an employee?',
+                        'answer_uz': 'Xodim profilida "Qo\'ng\'iroq" tugmasini bosing. Xodim bildirishnoma orqali javob beradi.',
+                        'answer_kr': 'Xodim profilida "Qo\'ng\'iroq" tugmasini bosing. Xodim bildirishnoma arqali javob beradi.',
+                        'answer_ru': 'Нажмите кнопку "Позвонить" в профиле сотрудника. Сотрудник ответит через уведомление.',
+                        'answer_en': 'Tap the "Call" button on the employee profile. The employee will respond via notification.',
+                    },
+                    {
+                        'question_uz': 'Xodim javob bermasa nima qilaman?',
+                        'question_kr': 'Xodim javob bermasa nima qilaman?',
+                        'question_ru': 'Что делать, если сотрудник не отвечает?',
+                        'question_en': 'What if the employee does not answer?',
+                        'answer_uz': 'Agar xodim javob bermasa, siz unga xabar qoldirishingiz mumkin.',
+                        'answer_kr': 'Agar xodim javob bermasa, siz unga xabar qaldiriwingiz mumkin.',
+                        'answer_ru': 'Если сотрудник не отвечает, вы можете оставить ему сообщение.',
+                        'answer_en': 'If the employee does not answer, you can leave them a message.',
+                    },
+                ],
+            },
+            {
+                'name_uz': 'Ish vaqti',
+                'name_kr': 'Ish vaqti',
+                'name_ru': 'Рабочее время',
+                'name_en': 'Working Hours',
+                'faqs': [
+                    {
+                        'question_uz': 'Xodimning ish vaqtini qanday bilaman?',
+                        'question_kr': 'Xodimning ish vaqtini qanday bilamen?',
+                        'question_ru': 'Как узнать рабочее время сотрудника?',
+                        'question_en': 'How can I find out an employee\'s working hours?',
+                        'answer_uz': 'Xodim profilida ish vaqti ko\'rsatilgan: ish kunlari va soatlari.',
+                        'answer_kr': 'Xodim profilida ish vaqti ko\'rsatilgan: ish kunlari va soatlari.',
+                        'answer_ru': 'Рабочее время указано в профиле сотрудника: рабочие дни и часы.',
+                        'answer_en': 'Working hours are shown in the employee profile: working days and hours.',
+                    },
+                    {
+                        'question_uz': 'Dam olish kunlari kim ishlaydi?',
+                        'question_kr': 'Dam olish kunlari kim ishlaydi?',
+                        'question_ru': 'Кто работает в выходные?',
+                        'question_en': 'Who works on weekends?',
+                        'answer_uz': 'Ba\'zi xodimlar shanba kuni ham ishlaydi. Profillarida ish kunlari ko\'rsatilgan.',
+                        'answer_kr': 'Ba\'zi xodimlar shanba kuni ham ishlaydi. Profillarida ish kunlari ko\'rsatilgan.',
+                        'answer_ru': 'Некоторые сотрудники работают и по субботам. Рабочие дни указаны в их профилях.',
+                        'answer_en': 'Some employees also work on Saturdays. Working days are shown in their profiles.',
+                    },
+                ],
+            },
+            {
+                'name_uz': 'Texnik yordam',
+                'name_kr': 'Texnik jardam',
+                'name_ru': 'Техническая поддержка',
+                'name_en': 'Technical Support',
+                'faqs': [
+                    {
+                        'question_uz': 'Kiosk ishlamay qolsa nima qilaman?',
+                        'question_kr': 'Kiosk ishlamay qalsa nima qilaman?',
+                        'question_ru': 'Что делать, если киоск перестал работать?',
+                        'question_en': 'What should I do if the kiosk stops working?',
+                        'answer_uz': 'Iltimos, qabul xonasidagi xodimga murojaat qiling yoki +998 90 123 45 67 raqamiga qo\'ng\'iroq qiling.',
+                        'answer_kr': 'Iltimos, qabul xonasidagi xodimga murojaat qiling yoki +998 90 123 45 67 raqamiga qo\'ng\'iroq qiling.',
+                        'answer_ru': 'Пожалуйста, обратитесь к сотруднику на рецепции или позвоните по номеру +998 90 123 45 67.',
+                        'answer_en': 'Please contact the reception staff or call +998 90 123 45 67.',
+                    },
+                    {
+                        'question_uz': 'Ekran sensorini ishlatishda muammo bor.',
+                        'question_kr': 'Ekran sensorini ishlatishda muammo bar.',
+                        'question_ru': 'Проблема с сенсорным экраном.',
+                        'question_en': 'There is a problem with the touch screen.',
+                        'answer_uz': 'Ekranni yumshoq mato bilan tozalang. Agar muammo davom etsa, texnik xodimga xabar bering.',
+                        'answer_kr': 'Ekranni yumshoq mato bilan tozalang. Agar muammo davom etse, texnik xodimga xabar bering.',
+                        'answer_ru': 'Протрите экран мягкой тканью. Если проблема продолжается, сообщите техническому специалисту.',
+                        'answer_en': 'Wipe the screen with a soft cloth. If the problem persists, notify technical staff.',
+                    },
+                ],
+            },
+        ]
+
+        total_faqs = 0
+        for cat_data in faq_categories_data:
+            faqs_list = cat_data.pop('faqs')
+            category = FAQCategory.objects.create(**cat_data)
+            self.stdout.write(f'Created FAQ category: {category.name_uz}')
+
+            for faq_data in faqs_list:
+                FAQ.objects.create(category=category, **faq_data)
+                total_faqs += 1
+
+        self.stdout.write(self.style.SUCCESS(f'Successfully created {len(faq_categories_data)} FAQ categories with {total_faqs} FAQs'))
+
+        # ── Analytics Fake Data: Visits, Rings, ServiceRequests ──
+        import random, uuid
+
+        Ring.objects.all().delete()
+        KioskVisit.objects.all().delete()
+        ServiceRequest.objects.all().delete()
+
+        now = timezone.now()
+        languages = ['uz', 'ru', 'en', 'kr']
+        responses = ['coming', 'busy', 'day_off', '']  # '' = no response
+
+        # Generate 30 days of data
+        for days_ago in range(30):
+            dt = now - timedelta(days=days_ago)
+            daily_visits = random.randint(5, 25)
+
+            for _ in range(daily_visits):
+                # Random time during that day
+                hour = random.randint(8, 18)
+                visit_time = dt.replace(hour=hour, minute=random.randint(0, 59), second=0, microsecond=0)
+
+                visit = KioskVisit.objects.create(
+                    session_id=str(uuid.uuid4()),
+                    language=random.choice(languages),
+                )
+                KioskVisit.objects.filter(pk=visit.pk).update(created_at=visit_time)
+
+                # Each visit has 1-3 service requests
+                for _ in range(random.randint(1, 3)):
+                    target = random.choice(list(targets))
+                    action = random.choices(['view', 'ring', 'message'], weights=[6, 3, 1])[0]
+                    sr = ServiceRequest.objects.create(target=target, visit=visit, action=action)
+                    ServiceRequest.objects.filter(pk=sr.pk).update(created_at=visit_time)
+
+                    # If action is ring, create a Ring record
+                    if action == 'ring':
+                        ring_id = str(uuid.uuid4())
+                        resp = random.choice(responses)
+                        responded_at = visit_time + timedelta(seconds=random.randint(10, 120)) if resp else None
+                        ring = Ring.objects.create(
+                            ring_id=ring_id,
+                            target=target,
+                            caller_name=random.choice(['Mehmon', 'Visitor', 'Tashrif buyuruvchi']),
+                            response=resp,
+                            responded_at=responded_at,
+                        )
+                        Ring.objects.filter(pk=ring.pk).update(created_at=visit_time)
+
+        visit_count = KioskVisit.objects.count()
+        ring_count = Ring.objects.count()
+        sr_count = ServiceRequest.objects.count()
+        self.stdout.write(self.style.SUCCESS(
+            f'Successfully created analytics data: {visit_count} visits, {ring_count} rings, {sr_count} service requests'
+        ))

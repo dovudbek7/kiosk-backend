@@ -112,6 +112,15 @@ class MessageSerializer(serializers.ModelSerializer):
         return None
 
 
+class MessageCreateSerializer(serializers.Serializer):
+    """Serializer for creating messages from the kiosk (public, no auth)."""
+    targetId = serializers.IntegerField()
+    senderName = serializers.CharField(max_length=255)
+    type = serializers.ChoiceField(choices=Message.MessageType.choices, default=Message.MessageType.TEXT)
+    content = serializers.CharField(required=False, allow_blank=True, default='')
+    media = serializers.FileField(required=False)
+
+
 class DeviceSerializer(serializers.ModelSerializer):
     """Serializer for FCM Device model"""
     

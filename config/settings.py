@@ -139,6 +139,14 @@ REST_FRAMEWORK.update({
     ),
 })
 
+from datetime import timedelta
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(hours=1),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': False,
+}
+
 # drf-spectacular settings
 SPECTACULAR_SETTINGS = {
     'TITLE': 'Kiosk Backend API',
@@ -158,3 +166,7 @@ CHANNEL_LAYERS = {
         'CONFIG': {},
     },
 }
+
+# Firebase Admin SDK
+# Download service account key from: Firebase Console > Project Settings > Service Accounts
+FIREBASE_SERVICE_ACCOUNT_KEY = os.path.join(BASE_DIR, 'firebase-service-account.json')

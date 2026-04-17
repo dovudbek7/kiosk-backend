@@ -6,7 +6,7 @@ from django.http import HttpResponseRedirect
 from django.contrib import messages as django_messages
 from django.utils.translation import gettext_lazy as _
 import random, string
-from .models import ApplicationTarget, FAQ, FAQCategory, Message
+from .models import ApplicationTarget, FAQ, FAQCategory, Message, Ring, KioskVisit, ServiceRequest
 from .forms import TargetAdminForm
 
 def generate_pwd():
@@ -165,3 +165,25 @@ class FAQAdmin(admin.ModelAdmin):
     list_display = ('category', 'question_uz')
     list_filter = ('category',)
     search_fields = ('question_uz', 'answer_uz')
+
+
+@admin.register(Ring)
+class RingAdmin(admin.ModelAdmin):
+    list_display = ('ring_id', 'target', 'caller_name', 'response', 'created_at', 'responded_at')
+    list_filter = ('response', 'created_at')
+    search_fields = ('ring_id', 'caller_name')
+    readonly_fields = ('ring_id', 'created_at')
+
+
+@admin.register(KioskVisit)
+class KioskVisitAdmin(admin.ModelAdmin):
+    list_display = ('session_id', 'language', 'created_at')
+    list_filter = ('language', 'created_at')
+    readonly_fields = ('session_id', 'created_at')
+
+
+@admin.register(ServiceRequest)
+class ServiceRequestAdmin(admin.ModelAdmin):
+    list_display = ('target', 'action', 'created_at')
+    list_filter = ('action', 'created_at')
+    readonly_fields = ('created_at',)

@@ -16,4 +16,5 @@ referencing==0.37.0
 rest-framework-simplejwt==0.0.2
 rpds-py==0.30.0
 sqlparse==0.5.5
+firebase-admin==6.6.0
 uritemplate==4.2.0

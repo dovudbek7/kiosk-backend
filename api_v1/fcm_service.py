@@ -1,174 +1,177 @@
 """
-FCM (Firebase Cloud Messaging) Push Notification Service
+FCM (Firebase Cloud Messaging) Push Notification Service — FCM v1 API
 
-This module provides functions to send push notifications to registered devices.
+Uses the firebase-admin SDK with a service account key.
+Sends hybrid notification+data messages so Android's OS displays the
+notification even when the app is killed or dozing — data-only messages
+get deprioritized by Doze mode and can silently fail to deliver.
+
+In the foreground the Flutter app receives only the `data` block (OS does
+not display the `notification` block), so it renders its own styled local
+notification. In the background / terminated state the OS displays the
+`notification` block directly; the Flutter background isolate is instructed
+to skip showing a local notification to avoid duplicates.
 """
 
-import os
-import requests
+import logging
+import firebase_admin
+from firebase_admin import credentials, messaging
 from django.conf import settings
+
+logger = logging.getLogger(__name__)
+
+_app = None
+
+
+def _get_firebase_app():
+    """Initialize Firebase Admin SDK once per process."""
+    global _app
+    if _app is None:
+        cred = credentials.Certificate(settings.FIREBASE_SERVICE_ACCOUNT_KEY)
+        _app = firebase_admin.initialize_app(cred)
+    return _app
 
 
 class FCMNotificationError(Exception):
-    """Custom exception for FCM notification errors"""
     pass
 
 
-def get_fcm_server_key():
-    """Get FCM server key from settings or environment"""
-    return getattr(settings, 'FCM_SERVER_KEY', os.environ.get('FCM_SERVER_KEY', ''))
+def _deactivate_token(token):
+    """Mark a device as inactive when its FCM token is no longer valid."""
+    from api_v1.models import Device
+    Device.objects.filter(registration_id=token).update(active=False)
 
 
-def send_push_notification(registration_ids, data_message, notification_payload=None):
+def send_push_notification(
+    registration_ids,
+    data_message,
+    notification_title=None,
+    notification_body=None,
+    channel_id=None,
+):
     """
-    Send push notification to one or more devices via FCM.
-    
-    Args:
-        registration_ids: List of FCM device tokens
-        data_message: Dictionary of data payload (key-value pairs)
-        notification_payload: Optional dictionary with 'title' and 'body' for notification
-    
-    Returns:
-        dict: FCM response containing success/failure counts
-    
-    Raises:
-        FCMNotificationError: If FCM server key is not configured or request fails
+    Send an FCM message to one or more device tokens.
+
+    If `notification_title` is provided, a `notification` block is attached
+    so the Android OS can display the notification directly even when the
+    app is terminated or dozing. Omit it to send data-only.
+
+    All values in data_message must be strings (FCM v1 requirement).
     """
-    server_key = get_fcm_server_key()
-    
-    if not server_key:
-        raise FCMNotificationError("FCM_SERVER_KEY is not configured")
-    
+    _get_firebase_app()
+
     if not registration_ids:
         raise FCMNotificationError("No registration IDs provided")
-    
-    # Ensure registration_ids is a list
+
     if isinstance(registration_ids, str):
         registration_ids = [registration_ids]
-    
-    url = 'https://fcm.googleapis.com/fcm/send'
-    
-    payload = {
-        'registration_ids': registration_ids,
-        'data': data_message,
-    }
-    
-    # Add notification payload if provided
-    if notification_payload:
-        payload['notification'] = {
-            'title': notification_payload.get('title', ''),
-            'body': notification_payload.get('body', ''),
-            'sound': 'default',
-            'badge': '1',
-        }
-    
-    # Add priority for immediate delivery
-    payload['priority'] = 'high'
-    
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'key={server_key}',
-    }
-    
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        response.raise_for_status()
-        
-        result = response.json()
-        
-        # Check for errors in the response
-        if result.get('error'):
-            raise FCMNotificationError(f"FCM Error: {result['error']}")
-        
-        return {
-            'success': result.get('success', 0),
-            'failure': result.get('failure', 0),
-            'message_id': result.get('message_id'),
-            'results': result.get('results', []),
-        }
-        
-    except requests.exceptions.RequestException as e:
-        raise FCMNotificationError(f"Failed to send FCM notification: {str(e)}")
+
+    str_data = {k: str(v) for k, v in data_message.items()}
+
+    # Build Android config. When a notification block is attached we also
+    # pin the notification to a specific channel so the OS renders it with
+    # the correct importance/sound on Android 8+.
+    android_notification = None
+    if notification_title and channel_id:
+        android_notification = messaging.AndroidNotification(
+            channel_id=channel_id,
+            default_sound=True,
+            default_vibrate_timings=True,
+        )
+    android_config = messaging.AndroidConfig(
+        priority='high',
+        notification=android_notification,
+    )
+
+    top_notification = None
+    if notification_title:
+        top_notification = messaging.Notification(
+            title=notification_title,
+            body=notification_body or '',
+        )
+
+    results = []
+    for token in registration_ids:
+        msg = messaging.Message(
+            data=str_data,
+            token=token,
+            notification=top_notification,
+            android=android_config,
+        )
+        try:
+            message_id = messaging.send(msg)
+            logger.info('FCM sent to %s (msg_id=%s)', token[:12], message_id)
+            results.append({'token': token, 'success': True, 'message_id': message_id})
+        except messaging.UnregisteredError:
+            _deactivate_token(token)
+            results.append({'token': token, 'success': False, 'error': 'unregistered'})
+        except Exception as e:
+            logger.exception('FCM send failed for token %s', token)
+            results.append({'token': token, 'success': False, 'error': str(e)})
+
+    return results
 
 
-def send_to_user(user, data_message, notification_payload=None):
-    """
-    Send push notification to all devices belonging to a user.
-    
-    Args:
-        user: Django User instance
-        data_message: Dictionary of data payload
-        notification_payload: Optional notification payload
-    
-    Returns:
-        dict: Result from send_push_notification
-    """
+def send_to_user(user, data_message, **kwargs):
+    """Send a push notification to all active devices for a user."""
     from api_v1.models import Device
-    
-    # Get all active devices for the user
-    devices = Device.objects.filter(user=user, active=True)
-    
-    if not devices:
-        return {
-            'success': 0,
-            'failure': 0,
-            'message': 'No active devices found for user',
-        }
-    
-    registration_ids = list(devices.values_list('registration_id', flat=True))
-    
-    return send_push_notification(registration_ids, data_message, notification_payload)
+
+    tokens = list(
+        Device.objects.filter(user=user, active=True)
+        .values_list('registration_id', flat=True)
+    )
+    if not tokens:
+        logger.warning('No active devices for user %s — notification will not be delivered', user.id)
+        return []
+    return send_push_notification(tokens, data_message, **kwargs)
 
 
 def send_ring_notification(user, caller_name, message, ring_id):
     """
-    Send a ring notification to a user.
-    
-    Args:
-        user: Django User instance
-        caller_name: Name of the caller
-        message: Message to display
-        ring_id: Unique ring identifier
-    
-    Returns:
-        dict: Result from send_push_notification
+    Send a ring push notification using keys the Flutter app expects.
+
+    Flutter fcm_service.dart switches on data['event'] == 'ring'
+    and reads: ringId, callerName, message.
     """
-    data_message = {
-        'type': 'ring',
-        'ringId': ring_id,
+    data = {
+        'event': 'ring',
+        'ringId': str(ring_id),
         'callerName': caller_name,
         'message': message,
     }
-    
-    notification_payload = {
-        'title': f'📞 {caller_name}',
-        'body': message,
-    }
-    
-    return send_to_user(user, data_message, notification_payload)
+    return send_to_user(
+        user,
+        data,
+        notification_title=f'Ring from {caller_name}',
+        notification_body=message or 'Incoming call',
+        channel_id='rings',
+    )
 
 
-def send_message_notification(user, sender_name, content):
+def send_message_notification(user, sender_name, content, message_id, message_type='text'):
     """
-    Send a message notification to a user.
-    
-    Args:
-        user: Django User instance
-        sender_name: Name of the message sender
-        content: Message content
-    
-    Returns:
-        dict: Result from send_push_notification
+    Send a new_message push notification using keys the Flutter app expects.
+
+    Flutter fcm_service.dart switches on data['event'] == 'new_message'
+    and reads: messageId, senderName, preview, type.
     """
-    data_message = {
-        'type': 'new_message',
+    preview = content or ''
+    if not preview:
+        if message_type == 'audio':
+            preview = '🎤 Audio message'
+        elif message_type == 'video':
+            preview = '🎥 Video message'
+    data = {
+        'event': 'new_message',
+        'messageId': str(message_id),
         'senderName': sender_name,
-        'content': content,
+        'preview': preview[:100],
+        'type': message_type,
     }
-    
-    notification_payload = {
-        'title': f'💬 {sender_name}',
-        'body': content[:100] if len(content) > 100 else content,
-    }
-    
-    return send_to_user(user, data_message, notification_payload)
+    return send_to_user(
+        user,
+        data,
+        notification_title=sender_name,
+        notification_body=preview[:100] or 'New message',
+        channel_id='messages',
+    )
