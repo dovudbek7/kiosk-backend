@@ -85,12 +85,8 @@ class ApplicationTarget(models.Model):
     phone = models.CharField(max_length=20, unique=True, verbose_name='Telefon raqami')
     target_type = models.CharField(max_length=15, choices=Type.choices, verbose_name='Turi')
     image = models.ImageField(upload_to='profiles/', verbose_name='Rasm')
-    
-    def save(self, *args, **kwargs):
-        # Format phone number automatically
-        if self.phone:
-            self.phone = format_phone(self.phone)
-        super().save(*args, **kwargs)
+
+    name = models.CharField(max_length=255, verbose_name='To\'liq ism', default='', blank=True)
     
     # Lavozim va Idora (4 tilda)
     position_uz = models.CharField(max_length=255, verbose_name='Lavozim (O\'zbekcha)')
@@ -121,7 +117,16 @@ class ApplicationTarget(models.Model):
     
     # Legacy field - keeps the formatted string for API
     working_hours = models.CharField(max_length=100, blank=True)
+
+    # Search Tags (4 tilda)
+    tags_uz = models.TextField(blank=True, verbose_name='Qidiruv teglari (O\'zbekcha)')
+    tags_kr = models.TextField(blank=True, verbose_name='Qidiruv teglari (Qoraqalpoq)')
+    tags_ru = models.TextField(blank=True, verbose_name='Qidiruv teglari (Ruscha)')
+    tags_en = models.TextField(blank=True, verbose_name='Qidiruv teglari (Inglizcha)')
     
+    # Temporary password storage (cleared after display)
+    temp_password = models.CharField(max_length=128, blank=True, editable=False)
+
     def save(self, *args, **kwargs):
         # Format phone number automatically
         if self.phone:
@@ -132,15 +137,6 @@ class ApplicationTarget(models.Model):
             end_str = self.work_end.strftime('%H:%M')
             self.working_hours = f"{self.work_days} {start_str}-{end_str}"
         super().save(*args, **kwargs)
-    
-    # Search Tags (4 tilda)
-    tags_uz = models.TextField(blank=True, verbose_name='Qidiruv teglari (O\'zbekcha)')
-    tags_kr = models.TextField(blank=True, verbose_name='Qidiruv teglari (Qoraqalpoq)')
-    tags_ru = models.TextField(blank=True, verbose_name='Qidiruv teglari (Ruscha)')
-    tags_en = models.TextField(blank=True, verbose_name='Qidiruv teglari (Inglizcha)')
-    
-    # Temporary password storage (cleared after display)
-    temp_password = models.CharField(max_length=128, blank=True, editable=False)
 
     def __str__(self):
         return self.user.get_full_name() or self.phone

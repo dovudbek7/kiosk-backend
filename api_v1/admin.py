@@ -25,8 +25,9 @@ def send_sms(phone, message_text):
 @admin.register(ApplicationTarget)
 class TargetAdmin(admin.ModelAdmin):
     form = TargetAdminForm
-    list_display = ('phone', 'target_type', 'agency_uz', 'user_status', 'generate_password_button')
-    exclude = ('user',)
+    list_display = ('name', 'phone', 'target_type', 'agency_uz', 'user_status', 'generate_password_button')
+    # exclude = ('user',)
+    exclude = ('user', 'working_hours')
     
     # Add custom form fields
     readonly_fields = ('password_display',)
@@ -37,7 +38,7 @@ class TargetAdmin(admin.ModelAdmin):
             'description': 'Telefon raqami avtomatik formatlanadi. Parol quyida generatsiya qilinadi.'
         }),
         ('👤 Asosiy ma\'lumotlar', {
-            'fields': ('target_type', 'image')
+            'fields': ('name','target_type', 'image')
         }),
         ('💼 Lavozim va tashkilot', {
             'fields': ('position_uz', 'position_ru', 'position_en', 'position_kr',
@@ -89,7 +90,7 @@ class TargetAdmin(admin.ModelAdmin):
     generate_password_button.short_description = 'Amallar'
 
     def save_model(self, request, obj, form, change):
-        """Auto-create Django User on first save"""
+        """Auto-create Django User on first save and sync first_name"""
         if not change:  # Yangi hodim qo'shilayotganda
             # 1. Format phone (done in model.save() but ensure it here)
             from .models import format_phone
@@ -102,7 +103,8 @@ class TargetAdmin(admin.ModelAdmin):
             new_user = User.objects.create_user(
                 username=username,
                 password=password,
-                is_staff=False
+                is_staff=False,
+                first_name=obj.name  # Set first_name from ApplicationTarget.name
             )
             
             # 3. Link to ApplicationTarget
@@ -123,7 +125,22 @@ class TargetAdmin(admin.ModelAdmin):
                 f'SMS {obj.phone} raqamiga jo\'natildi.'
             )
         else:
-            super().save_model(request, obj, form, change)
+            # Mavjud hodim tahrirlanayotganda
+            # Get original object to check if name changed
+            original_obj = ApplicationTarget.objects.get(pk=obj.pk)
+            
+            # Save the ApplicationTarget first
+            obj.save()
+            
+            # Agar name o'zgargan bo'lsa, User.first_name ni ham yangilash
+            if original_obj.name != obj.name and obj.user:
+                obj.user.first_name = obj.name
+                obj.user.save()
+                
+            django_messages.success(
+                request,
+                f'✅ Hodim ma\'lumotlari yangilandi.'
+            )
 
 
 @admin.register(Message)

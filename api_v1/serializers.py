@@ -49,8 +49,29 @@ class FAQSerializer(serializers.ModelSerializer):
             lang = 'uz'
         return getattr(obj, f'answer_{lang}', obj.answer_uz)
 
+def get_localized_field(obj, field_prefix, default_field):
+    """
+    Helper function to get localized field value based on language.
+    Uses DRY principle to avoid repeating language logic.
+    """
+    from rest_framework import request as rf_request
+    # Get language from context
+    request = obj.__class__.__dict__.get('_context', {})
+    if isinstance(request, dict):
+        req = request.get('request')
+    else:
+        req = None
+    
+    lang = 'uz'
+    if req and hasattr(req, 'query_params'):
+        lang = req.query_params.get('lang', 'uz')
+        if lang not in ['uz', 'ru', 'en', 'kr']:
+            lang = 'uz'
+    
+    return getattr(obj, f'{field_prefix}_{lang}', getattr(obj, default_field))
+
 class TargetSerializer(serializers.ModelSerializer):
-    name = serializers.SerializerMethodField()
+    name = serializers.CharField(read_only=True)
     position = serializers.SerializerMethodField()
     agency = serializers.SerializerMethodField()
     description = serializers.SerializerMethodField()
@@ -60,33 +81,30 @@ class TargetSerializer(serializers.ModelSerializer):
         model = ApplicationTarget
         fields = ['id', 'target_type', 'image', 'name', 'position', 'agency', 'description', 'working_hours']
 
+    def _get_language(self):
+        """Helper method to get current language from request context."""
+        request = self.context.get('request')
+        if request:
+            lang = request.query_params.get('lang', 'uz')
+            if lang not in ['uz', 'ru', 'en', 'kr']:
+                lang = 'uz'
+            return lang
+        return 'uz'
+
     @extend_schema_field(serializers.CharField())
     def get_position(self, obj):
-        lang = self.context.get('request').query_params.get('lang', 'uz')
-        # Validate language
-        if lang not in ['uz', 'ru', 'en', 'kr']:
-            lang = 'uz'
+        lang = self._get_language()
         return getattr(obj, f'position_{lang}', obj.position_uz)
 
     @extend_schema_field(serializers.CharField())
     def get_agency(self, obj):
-        lang = self.context.get('request').query_params.get('lang', 'uz')
-        # Validate language
-        if lang not in ['uz', 'ru', 'en', 'kr']:
-            lang = 'uz'
+        lang = self._get_language()
         return getattr(obj, f'agency_{lang}', obj.agency_uz)
 
     @extend_schema_field(serializers.CharField())
     def get_description(self, obj):
-        lang = self.context.get('request').query_params.get('lang', 'uz')
-        # Validate language
-        if lang not in ['uz', 'ru', 'en', 'kr']:
-            lang = 'uz'
+        lang = self._get_language()
         return getattr(obj, f'desc_{lang}', obj.desc_uz)
-
-    @extend_schema_field(serializers.CharField())
-    def get_name(self, obj):
-        return obj.user.get_full_name() or obj.user.username or obj.phone
 
     @extend_schema_field(serializers.URLField())
     def get_image(self, obj):
