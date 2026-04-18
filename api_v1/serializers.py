@@ -14,7 +14,7 @@ class FAQCategorySerializer(serializers.ModelSerializer):
     def get_name(self, obj):
         lang = self.context.get('request').query_params.get('lang', 'uz')
         # Validate language
-        if lang not in ['uz', 'ru', 'en', 'kr']:
+        if lang not in ['uz', 'ru', 'en', 'kk', 'kir']:
             lang = 'uz'
         return getattr(obj, f'name_{lang}', obj.name_uz)
 
@@ -37,7 +37,7 @@ class FAQSerializer(serializers.ModelSerializer):
     def get_question(self, obj):
         lang = self.context.get('request').query_params.get('lang', 'uz')
         # Validate language
-        if lang not in ['uz', 'ru', 'en', 'kr']:
+        if lang not in ['uz', 'ru', 'en', 'kk', 'kir']:
             lang = 'uz'
         return getattr(obj, f'question_{lang}', obj.question_uz)
 
@@ -45,7 +45,7 @@ class FAQSerializer(serializers.ModelSerializer):
     def get_answer(self, obj):
         lang = self.context.get('request').query_params.get('lang', 'uz')
         # Validate language
-        if lang not in ['uz', 'ru', 'en', 'kr']:
+        if lang not in ['uz', 'ru', 'en', 'kk', 'kir']:
             lang = 'uz'
         return getattr(obj, f'answer_{lang}', obj.answer_uz)
 
@@ -65,7 +65,7 @@ def get_localized_field(obj, field_prefix, default_field):
     lang = 'uz'
     if req and hasattr(req, 'query_params'):
         lang = req.query_params.get('lang', 'uz')
-        if lang not in ['uz', 'ru', 'en', 'kr']:
+        if lang not in ['uz', 'ru', 'en', 'kk', 'kir']:
             lang = 'uz'
     
     return getattr(obj, f'{field_prefix}_{lang}', getattr(obj, default_field))
@@ -86,7 +86,7 @@ class TargetSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         if request:
             lang = request.query_params.get('lang', 'uz')
-            if lang not in ['uz', 'ru', 'en', 'kr']:
+            if lang not in ['uz', 'ru', 'en', 'kk', 'kir']:
                 lang = 'uz'
             return lang
         return 'uz'

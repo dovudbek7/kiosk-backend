@@ -41,18 +41,18 @@ class TargetAdmin(admin.ModelAdmin):
             'fields': ('name','target_type', 'image')
         }),
         ('💼 Lavozim va tashkilot', {
-            'fields': ('position_uz', 'position_ru', 'position_en', 'position_kr',
-                      'agency_uz', 'agency_ru', 'agency_en', 'agency_kr')
+            'fields': ('position_uz', 'position_kk', 'position_kir', 'position_ru', 'position_en',
+                      'agency_uz', 'agency_kk', 'agency_kir', 'agency_ru', 'agency_en')
         }),
         ('📝 Tavsif', {
-            'fields': ('desc_uz', 'desc_ru', 'desc_en', 'desc_kr')
+            'fields': ('desc_uz', 'desc_kk', 'desc_kir', 'desc_ru', 'desc_en')
         }),
         ('⏰ Ish vaqti', {
             'fields': ('work_days', 'work_start', 'work_end'),
             'description': 'Ish kunlari va vaqtni tanlang. Avtomatik "Kunlar HH:MM-HH:MM" formatida yoziladi'
         }),
         ('🔍 Qidiruv teglari', {
-            'fields': ('tags_uz', 'tags_ru', 'tags_en', 'tags_kr'),
+            'fields': ('tags_uz', 'tags_kk', 'tags_kir', 'tags_ru', 'tags_en'),
             'classes': ('collapse',)
         }),
     )
@@ -161,8 +161,8 @@ class FAQInline(admin.TabularInline):
     extra = 1
     verbose_name = 'FAQ'
     verbose_name_plural = 'FAQlar'
-    fields = ('question_uz', 'question_ru', 'question_en', 'question_kr',
-              'answer_uz', 'answer_ru', 'answer_en', 'answer_kr')
+    fields = ('question_uz', 'question_kk', 'question_kir', 'question_ru', 'question_en',
+              'answer_uz', 'answer_kk', 'answer_kir', 'answer_ru', 'answer_en')
 
 
 @admin.register(FAQCategory)
@@ -172,7 +172,7 @@ class FAQCategoryAdmin(admin.ModelAdmin):
     inlines = [FAQInline]
     fieldsets = (
         ('', {
-            'fields': ('name_uz', 'name_ru', 'name_en', 'name_kr', 'icon')
+            'fields': ('name_uz', 'name_kk', 'name_kir', 'name_ru', 'name_en', 'icon')
         }),
     )
 

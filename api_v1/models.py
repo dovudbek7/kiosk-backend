@@ -57,7 +57,8 @@ def format_phone(phone):
 
 class FAQCategory(models.Model):
     name_uz = models.CharField(max_length=255, verbose_name='Nomi (O\'zbekcha)')
-    name_kr = models.CharField(max_length=255, verbose_name='Nomi (Qoraqalpoq)')
+    name_kk = models.CharField(max_length=255, verbose_name='Nomi (Qoraqalpoq)')
+    name_kir = models.CharField(max_length=255, verbose_name='Nomi (Kirilcha)')
     name_ru = models.CharField(max_length=255, verbose_name='Nomi (Ruscha)')
     name_en = models.CharField(max_length=255, verbose_name='Nomi (Inglizcha)')
     icon = models.ImageField(upload_to='icons/', null=True, blank=True, verbose_name='Ikona')
@@ -90,17 +91,20 @@ class ApplicationTarget(models.Model):
     
     # Lavozim va Idora (4 tilda)
     position_uz = models.CharField(max_length=255, verbose_name='Lavozim (O\'zbekcha)')
-    position_kr = models.CharField(max_length=255, verbose_name='Lavozim (Qoraqalpoq)')
+    position_kk = models.CharField(max_length=255, verbose_name='Lavozim (Qoraqalpoq)')
+    position_kir = models.CharField(max_length=255, verbose_name='Lavozim (Kirilcha)')
     position_ru = models.CharField(max_length=255, verbose_name='Lavozim (Ruscha)')
     position_en = models.CharField(max_length=255, verbose_name='Lavozim (Inglizcha)')
 
     agency_uz = models.CharField(max_length=255, verbose_name='Tashkilot (O\'zbekcha)')
-    agency_kr = models.CharField(max_length=255, verbose_name='Tashkilot (Qoraqalpoq)')
+    agency_kk = models.CharField(max_length=255, verbose_name='Tashkilot (Qoraqalpoq)')
+    agency_kir = models.CharField(max_length=255, verbose_name='Tashkilot (Kirilcha)')
     agency_ru = models.CharField(max_length=255, verbose_name='Tashkilot (Ruscha)')
     agency_en = models.CharField(max_length=255, verbose_name='Tashkilot (Inglizcha)')
 
     desc_uz = models.TextField(verbose_name='Tavsif (O\'zbekcha)')
-    desc_kr = models.TextField(verbose_name='Tavsif (Qoraqalpoq)')
+    desc_kk = models.TextField(verbose_name='Tavsif (Qoraqalpoq)')
+    desc_kir = models.TextField(verbose_name='Tavsif (Kirilcha)')
     desc_ru = models.TextField(verbose_name='Tavsif (Ruscha)')
     desc_en = models.TextField(verbose_name='Tavsif (Inglizcha)')
 
@@ -120,7 +124,8 @@ class ApplicationTarget(models.Model):
 
     # Search Tags (4 tilda)
     tags_uz = models.TextField(blank=True, verbose_name='Qidiruv teglari (O\'zbekcha)')
-    tags_kr = models.TextField(blank=True, verbose_name='Qidiruv teglari (Qoraqalpoq)')
+    tags_kk = models.TextField(blank=True, verbose_name='Qidiruv teglari (Qoraqalpoq)')
+    tags_kir = models.TextField(blank=True, verbose_name='Qidiruv teglari (Kirilcha)')
     tags_ru = models.TextField(blank=True, verbose_name='Qidiruv teglari (Ruscha)')
     tags_en = models.TextField(blank=True, verbose_name='Qidiruv teglari (Inglizcha)')
     
@@ -144,12 +149,14 @@ class ApplicationTarget(models.Model):
 class FAQ(models.Model):
     category = models.ForeignKey(FAQCategory, on_delete=models.CASCADE, related_name='faqs', verbose_name='Kategoriya')
     question_uz = models.TextField(verbose_name='Savol (O\'zbekcha)')
-    question_kr = models.TextField(verbose_name='Savol (Qoraqalpoq)')
+    question_kk = models.TextField(verbose_name='Savol (Qoraqalpoq)')
+    question_kir = models.TextField(verbose_name='Savol (Kirilcha)')
     question_ru = models.TextField(verbose_name='Savol (Ruscha)')
     question_en = models.TextField(verbose_name='Savol (Inglizcha)')
     
     answer_uz = models.TextField(verbose_name='Javob (O\'zbekcha)')
-    answer_kr = models.TextField(verbose_name='Javob (Qoraqalpoq)')
+    answer_kk = models.TextField(verbose_name='Javob (Qoraqalpoq)')
+    answer_kir = models.TextField(verbose_name='Javob (Kirilcha)')
     answer_ru = models.TextField(verbose_name='Javob (Ruscha)')
     answer_en = models.TextField(verbose_name='Javob (Inglizcha)')
 
