@@ -1,299 +1,569 @@
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status, permissions, viewsets, serializers
-from django.contrib.auth import authenticate
-from django.contrib.auth.models import User
-from django.http import StreamingHttpResponse
-from django.shortcuts import redirect
-from django.contrib.admin.views.decorators import staff_member_required
-from django.utils.decorators import method_decorator
-import json, time, random, string
+"""District-scoped views for the kiosk API.
 
-from rest_framework_simplejwt.views import TokenObtainPairView
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from drf_spectacular.utils import extend_schema, extend_schema_view
+All ViewSets/APIViews use ``request.district`` (set by
+``DistrictResolverMiddleware``) to scope reads and writes. Cross-tenant
+access is impossible at the queryset level even if a caller supplies a
+target ID from another district.
 
-from .models import ApplicationTarget, FAQ, FAQCategory, Message, Device, Ring, KioskVisit, ServiceRequest
-from .serializers import TargetSerializer, FAQSerializer, FAQCategorySerializer, MessageSerializer, MessageCreateSerializer, DeviceSerializer
-from . import notifications
+Swagger annotations live in ``api_v1.swagger`` so this module stays focused
+on behaviour. Use ``Tags.X`` for grouping and ``Responses.X`` /
+``Examples.X`` for reusable response objects.
+"""
+
+import json
+import random
+import string
 import uuid
 
+from django.contrib.auth import authenticate
+from django.contrib.admin.views.decorators import staff_member_required
+from django.db.models import Count, Q
+from django.db.models.functions import TruncDate
+from django.http import StreamingHttpResponse
+from django.shortcuts import redirect
+from django.utils import timezone
+from django.utils.decorators import method_decorator
+
+from rest_framework import permissions, serializers, status, viewsets
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework_simplejwt.views import TokenObtainPairView
+
+from drf_spectacular.utils import (
+    OpenApiExample,
+    OpenApiResponse,
+    extend_schema,
+    extend_schema_view,
+)
+
+from . import notifications
+from .mixins import DistrictScopedMixin, DistrictSlugURLKwargMixin
+from .models import (
+    ApplicationTarget,
+    Device,
+    FAQ,
+    FAQCategory,
+    KioskVisit,
+    Message,
+    Ring,
+    ServiceRequest,
+)
+from .permissions import (
+    IsDistrictAdmin,
+    IsKioskOrDistrictAdmin,
+)
+from .serializers import (
+    DeviceSerializer,
+    FAQCategorySerializer,
+    FAQSerializer,
+    MessageCreateSerializer,
+    MessageSerializer,
+    TargetSerializer,
+)
+from .swagger import (
+    DISTRICT_SLUG_PARAM,
+    LANG_PARAM,
+    PERIOD_PARAM,
+    RING_ID_PARAM,
+    Examples,
+    Responses,
+    Tags,
+)
+
+
+# ─────────────────── Inline request serializers (Swagger) ───────────────────
+# Spectacular generates clean component schemas from these — much better than
+# inline dicts in @extend_schema(request=...).
+
+class LoginRequest(serializers.Serializer):
+    phone = serializers.CharField(help_text='+998901234567')
+    password = serializers.CharField(help_text='User password')
+
+
+class FcmTokenRequest(serializers.Serializer):
+    fcmToken = serializers.CharField(help_text='Firebase Cloud Messaging registration ID')
+
+
+class KioskVisitRequest(serializers.Serializer):
+    language = serializers.ChoiceField(
+        choices=['uz', 'ru', 'en', 'kk', 'kir'],
+        required=False, default='uz',
+    )
+
+
+class ServiceRequestRequest(serializers.Serializer):
+    targetId = serializers.IntegerField()
+    sessionId = serializers.CharField(required=False, allow_blank=True)
+    action = serializers.ChoiceField(
+        choices=['view', 'ring', 'message'], default='view',
+    )
+
+
+class RingTriggerRequest(serializers.Serializer):
+    targetId = serializers.IntegerField()
+    callerName = serializers.CharField(required=False, allow_blank=True,
+                                        default='Reception Visitor')
+    message = serializers.CharField(required=False, allow_blank=True,
+                                     default='You have a visitor at reception!')
+
+
+class RingRespondRequest(serializers.Serializer):
+    response = serializers.ChoiceField(choices=['busy', 'day_off', 'coming'])
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  AUTH
+# ═════════════════════════════════════════════════════════════════════════
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
-    """Custom serializer that uses phone number instead of username for login"""
-    
+    """Phone-based JWT login. Embeds district + role claims in the token."""
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Make username not required (it will be overridden in validate)
         self.fields['username'].required = False
-        # Add phone field
         self.fields['phone'] = serializers.CharField(required=False)
-    
+
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
         token['userId'] = user.id
+        token['is_superadmin'] = bool(user.is_superuser)
+        profile = getattr(user, 'district_admin', None)
+        token['district_slug'] = profile.district.slug if profile else None
         return token
 
     def validate(self, attrs):
-        # Get phone from request (either 'phone' field or as username)
         phone = attrs.get('phone') or attrs.get('username')
         password = attrs.get('password')
-
         if not phone:
             raise serializers.ValidationError({'phone': 'Phone number is required'})
         if not password:
             raise serializers.ValidationError({'password': 'Password is required'})
 
-        # Normalize phone to +998XXXXXXXXX so it matches User.username
         from .models import format_phone
         phone = format_phone(phone)
 
-        # Authenticate with phone as username
         user = authenticate(username=phone, password=password)
         if not user:
             raise serializers.ValidationError('No active account found with the given credentials')
 
-        # Get token
         token = self.get_token(user)
-        
-        # Get the ApplicationTarget to return phone number
         try:
             target = ApplicationTarget.objects.get(user=user)
             phone_number = target.phone
         except ApplicationTarget.DoesNotExist:
             phone_number = user.username
-        
+
+        profile = getattr(user, 'district_admin', None)
         return {
             'access': str(token.access_token),
             'refresh': str(token),
             'user': {
                 'id': user.id,
                 'phone': phone_number,
-            }
+                'is_superadmin': bool(user.is_superuser),
+                'district_slug': profile.district.slug if profile else None,
+            },
         }
 
 
 @extend_schema_view(
     post=extend_schema(
-        summary='Login with phone and password',
-        description='Authenticate using phone number and password. Returns JWT tokens.',
-        request={
-            'type': 'object',
-            'properties': {
-                'phone': {'type': 'string', 'example': '+998901234567'},
-                'password': {'type': 'string', 'example': 'password123'}
-            },
-            'required': ['phone', 'password']
-        },
+        tags=[Tags.AUTH],
+        summary='Login (phone + password)',
+        description=(
+            'Authenticate with phone number and password. Returns JWT tokens '
+            'and user info. The access token contains `district_slug` and '
+            '`is_superadmin` claims that the frontend uses to route to '
+            '`/api/v1/<district_slug>/...`.\n\n'
+            '**How to use in Swagger:**\n'
+            '1. POST your credentials here.\n'
+            '2. Copy the `access` token from the response.\n'
+            '3. Click **Authorize** (top-right) and paste `Bearer <access>`.\n'
+            '4. Every subsequent request will be authenticated.'
+        ),
+        request=LoginRequest,
+        examples=[Examples.LOGIN_BODY_DISTRICT_ADMIN, Examples.LOGIN_BODY_SUPER_ADMIN],
         responses={
-            200: {
-                'type': 'object',
-                'properties': {
-                    'access': {'type': 'string'},
-                    'refresh': {'type': 'string'},
-                    'user': {
-                        'type': 'object',
-                        'properties': {
-                            'id': {'type': 'integer'},
-                            'phone': {'type': 'string'}
-                        }
-                    }
-                }
-            }
-        }
+            200: OpenApiResponse(description='JWT pair + user info',
+                                 examples=[Examples.LOGIN_OK]),
+            400: Responses.VALIDATION_ERROR,
+            401: OpenApiResponse(
+                description='Invalid credentials',
+                examples=[OpenApiExample('Bad password',
+                          value={'detail': 'No active account found with the given credentials'})],
+            ),
+        },
     )
 )
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
 
 
-# FAQ va Target ViewSetlar faqat GET uchun
-class FAQCategoryViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = FAQCategory.objects.all()
-    serializer_class = FAQCategorySerializer
+@extend_schema(
+    tags=[Tags.AUTH],
+    summary='Register an FCM device token',
+    description='Bind a Firebase Cloud Messaging registration ID to the '
+                'authenticated user so push notifications can be delivered.',
+    request=FcmTokenRequest,
+    responses={
+        200: OpenApiResponse(description='Token registered',
+                             examples=[Examples.OK_TRUE]),
+        400: Responses.VALIDATION_ERROR,
+        401: Responses.UNAUTHORIZED,
+    },
+)
+class RegisterFcmTokenAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        fcm_token = request.data.get('fcmToken')
+        if not fcm_token:
+            return Response({'detail': 'fcmToken is required'}, status=400)
+        Device.objects.update_or_create(
+            registration_id=fcm_token,
+            defaults={'user': request.user, 'device_type': 'android', 'active': True},
+        )
+        return Response({'ok': True})
 
 
-class FAQViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = FAQ.objects.all()
-    serializer_class = FAQSerializer
+@extend_schema(
+    tags=[Tags.AUTH],
+    summary='Deactivate an FCM device token',
+    description='Called on logout. Marks the token as inactive so push '
+                'notifications stop reaching the device.',
+    request=FcmTokenRequest,
+    responses={
+        200: OpenApiResponse(description='Token deactivated',
+                             examples=[Examples.OK_TRUE]),
+        400: Responses.VALIDATION_ERROR,
+        401: Responses.UNAUTHORIZED,
+    },
+)
+class DeactivateFcmTokenAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        fcm_token = request.data.get('fcmToken')
+        if not fcm_token:
+            return Response({'detail': 'fcmToken is required'}, status=400)
+        Device.objects.filter(registration_id=fcm_token, user=request.user).update(active=False)
+        return Response({'ok': True})
 
 
-class TargetViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = ApplicationTarget.objects.all()
+# ═════════════════════════════════════════════════════════════════════════
+#  TARGETS  (employees / organizations — kiosk directory)
+# ═════════════════════════════════════════════════════════════════════════
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=[Tags.TARGETS],
+        summary='List employees & organizations in this district',
+        description='Public endpoint used by the kiosk to render the directory '
+                    'page. Each result is localized to the requested `lang`.',
+        parameters=[DISTRICT_SLUG_PARAM, LANG_PARAM],
+        responses={
+            200: OpenApiResponse(response=TargetSerializer(many=True),
+                                 description='Directory listing',
+                                 examples=[Examples.TARGET_LIST]),
+            404: Responses.DISTRICT_NOT_FOUND,
+        },
+    ),
+    retrieve=extend_schema(
+        tags=[Tags.TARGETS],
+        summary='Get a single target (employee/organization)',
+        description='Returns one target, localized to the requested `lang`. '
+                    'Cross-district IDs return 404.',
+        parameters=[DISTRICT_SLUG_PARAM, LANG_PARAM],
+        responses={
+            200: OpenApiResponse(response=TargetSerializer,
+                                 description='Target detail'),
+            404: Responses.NOT_FOUND,
+        },
+    ),
+)
+class TargetViewSet(DistrictScopedMixin, viewsets.ReadOnlyModelViewSet):
+    queryset = ApplicationTarget.objects.select_related('user', 'district').all()
     serializer_class = TargetSerializer
-
-
-class MessageCreateAPIView(APIView):
-    """Create a message from the kiosk to an employee (public, no auth required)."""
     permission_classes = [permissions.AllowAny]
 
-    @extend_schema(
-        description="Send a message from the kiosk to a target employee. Supports text, audio, and video.",
-        request=MessageCreateSerializer,
-        responses={201: MessageSerializer},
-    )
-    def post(self, request):
+
+# ═════════════════════════════════════════════════════════════════════════
+#  FAQ
+# ═════════════════════════════════════════════════════════════════════════
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=[Tags.FAQ],
+        summary='List FAQ categories',
+        description='Returns all FAQ categories. Names are localized to the '
+                    'requested `lang`. Categories are shared across districts '
+                    'in this build.',
+        parameters=[DISTRICT_SLUG_PARAM, LANG_PARAM],
+        responses={200: FAQCategorySerializer(many=True),
+                   404: Responses.DISTRICT_NOT_FOUND},
+    ),
+    retrieve=extend_schema(
+        tags=[Tags.FAQ],
+        summary='Get a single FAQ category',
+        parameters=[DISTRICT_SLUG_PARAM, LANG_PARAM],
+        responses={200: FAQCategorySerializer, 404: Responses.NOT_FOUND},
+    ),
+)
+class FAQCategoryViewSet(DistrictSlugURLKwargMixin, viewsets.ReadOnlyModelViewSet):
+    queryset = FAQCategory.objects.all()
+    serializer_class = FAQCategorySerializer
+    permission_classes = [permissions.AllowAny]
+
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=[Tags.FAQ],
+        summary='List FAQs',
+        description='Returns FAQ entries with question/answer localized.',
+        parameters=[DISTRICT_SLUG_PARAM, LANG_PARAM],
+        responses={200: FAQSerializer(many=True)},
+    ),
+    retrieve=extend_schema(
+        tags=[Tags.FAQ],
+        summary='Get a single FAQ',
+        parameters=[DISTRICT_SLUG_PARAM, LANG_PARAM],
+        responses={200: FAQSerializer, 404: Responses.NOT_FOUND},
+    ),
+)
+class FAQViewSet(DistrictSlugURLKwargMixin, viewsets.ReadOnlyModelViewSet):
+    queryset = FAQ.objects.all()
+    serializer_class = FAQSerializer
+    permission_classes = [permissions.AllowAny]
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  MESSAGES
+# ═════════════════════════════════════════════════════════════════════════
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=[Tags.MESSAGES],
+        summary='List messages in this district',
+        description=(
+            '* **District admins** see every message in their district.\n'
+            '* **Authenticated employees** see only messages addressed to '
+            'them (`target == request.user`).\n\n'
+            'Requires JWT.'
+        ),
+        parameters=[DISTRICT_SLUG_PARAM],
+        responses={
+            200: OpenApiResponse(response=MessageSerializer(many=True),
+                                 description='Inbox',
+                                 examples=[Examples.MESSAGE_LIST]),
+            401: Responses.UNAUTHORIZED,
+            403: Responses.FORBIDDEN_DISTRICT,
+            404: Responses.DISTRICT_NOT_FOUND,
+        },
+    ),
+    retrieve=extend_schema(
+        tags=[Tags.MESSAGES],
+        summary='Get a message by id',
+        parameters=[DISTRICT_SLUG_PARAM],
+        responses={
+            200: MessageSerializer,
+            401: Responses.UNAUTHORIZED,
+            404: Responses.NOT_FOUND,
+        },
+    ),
+)
+class MessageViewSet(DistrictScopedMixin, viewsets.ReadOnlyModelViewSet):
+    queryset = Message.objects.select_related('target', 'district').all().order_by('-timestamp')
+    serializer_class = MessageSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        u = self.request.user
+        if u.is_authenticated and not (u.is_superuser or hasattr(u, 'district_admin')):
+            qs = qs.filter(target=u)
+        return qs
+
+
+@extend_schema_view(
+    post=extend_schema(
+        tags=[Tags.MESSAGES],
+        summary='Send a message from the kiosk (text / audio / video)',
+        description=(
+            'Public endpoint used by the kiosk device. Accepts '
+            '**multipart/form-data** so audio/video can be uploaded directly '
+            'from Swagger UI:\n\n'
+            '| field        | type    | notes |\n'
+            '|--------------|---------|-------|\n'
+            '| `targetId`   | int     | Required. Must belong to the URL district. |\n'
+            '| `senderName` | string  | Required. Visitor name. |\n'
+            '| `type`       | enum    | `text`, `audio`, or `video`. |\n'
+            '| `content`    | string  | Required for `type=text`. |\n'
+            '| `media`      | file    | Required for audio/video. |\n\n'
+            'Cross-tenant `targetId` returns **404**.'
+        ),
+        parameters=[DISTRICT_SLUG_PARAM],
+        request={
+            'multipart/form-data': {
+                'type': 'object',
+                'properties': {
+                    'targetId': {'type': 'integer', 'example': 7},
+                    'senderName': {'type': 'string', 'example': 'Ali Valiyev'},
+                    'type': {'type': 'string', 'enum': ['text', 'audio', 'video'], 'example': 'text'},
+                    'content': {'type': 'string', 'example': 'Murojaatim bor edi'},
+                    'media': {'type': 'string', 'format': 'binary'},
+                },
+                'required': ['targetId', 'senderName', 'type'],
+            }
+        },
+        responses={
+            201: OpenApiResponse(response=MessageSerializer,
+                                 description='Message accepted',
+                                 examples=[Examples.MESSAGE_CREATED]),
+            400: Responses.VALIDATION_ERROR,
+            404: OpenApiResponse(description='Target or district not found',
+                                 examples=[OpenApiExample('Wrong district target',
+                                           value={'detail': 'Target not found'})]),
+        },
+    ),
+)
+class MessageCreateAPIView(DistrictSlugURLKwargMixin, APIView):
+    permission_classes = [IsKioskOrDistrictAdmin]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def post(self, request, *args, **kwargs):
         serializer = MessageCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         target_id = serializer.validated_data['targetId']
         try:
-            target = ApplicationTarget.objects.get(pk=target_id)
+            target = ApplicationTarget.objects.get(pk=target_id, district=request.district)
         except ApplicationTarget.DoesNotExist:
             return Response({'detail': 'Target not found'}, status=status.HTTP_404_NOT_FOUND)
 
         msg = Message.objects.create(
+            district=request.district,
             target=target.user,
             sender_name=serializer.validated_data['senderName'],
             type=serializer.validated_data['type'],
             content=serializer.validated_data.get('content', ''),
             media=serializer.validated_data.get('media'),
         )
-
-        # Track as service request
-        ServiceRequest.objects.create(target=target, action='message')
-
-        # SSE + FCM push are emitted by the post_save signal on Message.
-        # See api_v1.models.emit_message_event — keeping them in one place
-        # avoids duplicate pushes when messages are created here or elsewhere
-        # (e.g. admin, shell).
-
-        out = MessageSerializer(msg, context={'request': request})
-        return Response(out.data, status=status.HTTP_201_CREATED)
+        ServiceRequest.objects.create(
+            district=request.district, target=target, action='message',
+        )
+        return Response(
+            MessageSerializer(msg, context={'request': request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
+# Legacy unscoped endpoints kept for old mobile clients. Hidden from the
+# main Swagger groups under a "[Legacy]" prefix.
+
+@extend_schema(tags=[Tags.MESSAGES],
+               summary='[Legacy] List my messages',
+               description='Old endpoint without district scoping. Prefer '
+                           '`GET /api/v1/<district_slug>/messages/`.',
+               responses={200: MessageSerializer(many=True),
+                          401: Responses.UNAUTHORIZED})
 class MessageListAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-    @extend_schema(
-        description="Get all messages for the authenticated user",
-        responses=MessageSerializer(many=True),
-    )
     def get(self, request):
         msgs = Message.objects.filter(target=request.user).order_by('-timestamp')
-        serializer = MessageSerializer(msgs, many=True, context={'request': request})
-        return Response(serializer.data)
+        return Response(MessageSerializer(msgs, many=True, context={'request': request}).data)
 
 
+@extend_schema(tags=[Tags.MESSAGES],
+               summary='[Legacy] Get my message by id',
+               responses={200: MessageSerializer, 404: Responses.NOT_FOUND})
 class MessageDetailAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-    @extend_schema(
-        description="Get a single message by ID",
-        responses=MessageSerializer,
-    )
     def get(self, request, pk):
         try:
             msg = Message.objects.get(pk=pk, target=request.user)
         except Message.DoesNotExist:
-            return Response({'detail': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
-        serializer = MessageSerializer(msg, context={'request': request})
-        return Response(serializer.data)
+            return Response({'detail': 'Not found'}, status=404)
+        return Response(MessageSerializer(msg, context={'request': request}).data)
 
 
+@extend_schema(tags=[Tags.MESSAGES],
+               summary='[Legacy] Mark message as read',
+               responses={200: OpenApiResponse(description='OK',
+                                                examples=[Examples.OK_TRUE]),
+                          404: Responses.NOT_FOUND})
 class MessageReadAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-    @extend_schema(
-        description="Mark a message as read",
-        responses={200: {'type': 'object', 'properties': {'ok': {'type': 'boolean'}}}},
-    )
     def post(self, request, pk):
         try:
             msg = Message.objects.get(pk=pk, target=request.user)
         except Message.DoesNotExist:
-            return Response({'detail': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Not found'}, status=404)
         msg.is_read = True
         msg.save()
-        # optionally publish read event
         notifications.publish(request.user.id, {'type': 'message_read', 'id': msg.id})
         return Response({'ok': True})
 
 
-class RingRespondAPIView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+# ═════════════════════════════════════════════════════════════════════════
+#  RINGS
+# ═════════════════════════════════════════════════════════════════════════
 
-    @extend_schema(
-        description="Respond to a ring (incoming call) with one of: busy, day_off, coming",
-        request={'type': 'object', 'properties': {'response': {'type': 'string', 'enum': ['busy', 'day_off', 'coming']}}},
-        responses={200: {'type': 'object', 'properties': {'ok': {'type': 'boolean'}, 'ringId': {'type': 'string'}, 'response': {'type': 'string'}}}},
-    )
-    def post(self, request, ringId):
-        response = request.data.get('response')
-        if response not in ('busy', 'day_off', 'coming'):
-            return Response({'detail': 'Invalid response'}, status=status.HTTP_400_BAD_REQUEST)
-
-        responder_name = request.user.get_full_name() or request.user.username
-
-        # Persist the response to DB for analytics
-        from django.utils import timezone
-        Ring.objects.filter(ring_id=ringId).update(response=response, responded_at=timezone.now())
-
-        # Store response so the kiosk can poll for it
-        notifications.set_ring_response(ringId, response, responder_name)
-
-        # Also publish via SSE for any connected clients
-        notifications.publish(request.user.id, {'type': 'ring_response', 'ringId': ringId, 'response': response})
-
-        return Response({'ok': True, 'ringId': ringId, 'response': response})
-
-
-class RingTriggerAPIView(APIView):
-    """Trigger a ring notification to a target from the kiosk"""
-    permission_classes = [permissions.AllowAny]
-
-    @extend_schema(
-        description="Trigger a ring notification to a specific target user",
-        request={
-            'type': 'object',
-            'properties': {
-                'targetId': {'type': 'integer', 'description': 'ID of the target user to ring'},
-                'callerName': {'type': 'string', 'description': 'Name of the caller'},
-                'message': {'type': 'string', 'description': 'Optional message'},
-            },
-            'required': ['targetId']
+@extend_schema_view(
+    post=extend_schema(
+        tags=[Tags.RINGS],
+        summary='Trigger a ring (kiosk → employee)',
+        description='Sends a real-time "visitor at reception" notification '
+                    'to the target employee. Returns a `ringId` the kiosk '
+                    'then polls via `GET /targets/ring/{ringId}/status/`.',
+        parameters=[DISTRICT_SLUG_PARAM],
+        request=RingTriggerRequest,
+        examples=[Examples.RING_TRIGGER_BODY],
+        responses={
+            200: OpenApiResponse(description='Ring queued',
+                                 examples=[Examples.RING_TRIGGERED]),
+            400: Responses.VALIDATION_ERROR,
+            404: OpenApiResponse(description='Target or district not found',
+                                 examples=[OpenApiExample('Missing target',
+                                           value={'detail': 'Target not found'})]),
         },
-        responses={200: {'type': 'object', 'properties': {'ok': {'type': 'boolean'}, 'ringId': {'type': 'string'}}}},
-    )
-    def post(self, request):
+    ),
+)
+class RingTriggerAPIView(DistrictSlugURLKwargMixin, APIView):
+    permission_classes = [IsKioskOrDistrictAdmin]
+
+    def post(self, request, *args, **kwargs):
         target_id = request.data.get('targetId')
         caller_name = request.data.get('callerName', 'Reception Visitor')
         message = request.data.get('message', 'You have a visitor at reception!')
-        
+
         if not target_id:
-            return Response({'detail': 'targetId is required'}, status=status.HTTP_400_BAD_REQUEST)
-        
+            return Response({'detail': 'targetId is required'}, status=400)
+
         try:
-            target = ApplicationTarget.objects.get(pk=target_id)
+            target = ApplicationTarget.objects.get(pk=target_id, district=request.district)
         except ApplicationTarget.DoesNotExist:
-            return Response({'detail': 'Target not found'}, status=status.HTTP_404_NOT_FOUND)
-        
+            return Response({'detail': 'Target not found'}, status=404)
+
         ring_id = str(uuid.uuid4())
+        Ring.objects.create(district=request.district, ring_id=ring_id, target=target,
+                             caller_name=caller_name)
+        ServiceRequest.objects.create(district=request.district, target=target, action='ring')
 
-        # Persist the ring for analytics
-        Ring.objects.create(ring_id=ring_id, target=target, caller_name=caller_name)
-
-        # Track as a service request
-        ServiceRequest.objects.create(target=target, action='ring')
-
-        # Publish the ring event to the target user (in-memory for SSE/WebSocket)
         notifications.publish(target.user.id, {
-            'type': 'ring',
-            'ringId': ring_id,
-            'callerName': caller_name,
-            'message': message,
+            'type': 'ring', 'ringId': ring_id,
+            'callerName': caller_name, 'message': message,
         })
 
-        # Send FCM push notification
         try:
             from .fcm_service import send_ring_notification
-            send_ring_notification(
-                user=target.user,
-                caller_name=caller_name,
-                message=message,
-                ring_id=ring_id,
-            )
+            send_ring_notification(user=target.user, caller_name=caller_name,
+                                    message=message, ring_id=ring_id)
         except Exception:
             import logging
             logging.getLogger(__name__).exception('FCM ring push failed for target %s', target_id)
@@ -301,24 +571,67 @@ class RingTriggerAPIView(APIView):
         return Response({'ok': True, 'ringId': ring_id})
 
 
-class RingStatusAPIView(APIView):
-    """Poll the status of a ring. Used by the kiosk to check if the employee responded."""
+@extend_schema_view(
+    post=extend_schema(
+        tags=[Tags.RINGS],
+        summary='Respond to a ring (employee → kiosk)',
+        description='Employee replies to a ring with one of '
+                    '`coming` / `busy` / `day_off`. Updates the ring '
+                    'record + publishes an SSE event to the kiosk.',
+        parameters=[DISTRICT_SLUG_PARAM, RING_ID_PARAM],
+        request=RingRespondRequest,
+        examples=[Examples.RING_RESPOND_BODY],
+        responses={
+            200: OpenApiResponse(description='Response recorded',
+                                 examples=[OpenApiExample('Coming',
+                                           value={'ok': True, 'ringId': 'b1f0...', 'response': 'coming'})]),
+            400: Responses.VALIDATION_ERROR,
+            401: Responses.UNAUTHORIZED,
+            404: Responses.NOT_FOUND,
+        },
+    ),
+)
+class RingRespondAPIView(DistrictSlugURLKwargMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, ringId, *args, **kwargs):
+        response = request.data.get('response')
+        if response not in ('busy', 'day_off', 'coming'):
+            return Response({'detail': 'Invalid response'}, status=400)
+
+        ring_qs = Ring.objects.filter(ring_id=ringId)
+        district = getattr(request, 'district', None)
+        if district is not None and not request.user.is_superuser:
+            ring_qs = ring_qs.filter(district=district)
+        if not ring_qs.exists():
+            return Response({'detail': 'Ring not found'}, status=404)
+
+        responder_name = request.user.get_full_name() or request.user.username
+        ring_qs.update(response=response, responded_at=timezone.now())
+        notifications.set_ring_response(ringId, response, responder_name)
+        notifications.publish(request.user.id,
+                               {'type': 'ring_response', 'ringId': ringId, 'response': response})
+        return Response({'ok': True, 'ringId': ringId, 'response': response})
+
+
+@extend_schema_view(
+    get=extend_schema(
+        tags=[Tags.RINGS],
+        summary='Poll ring status (kiosk)',
+        description='Public endpoint. Kiosk polls until `status` is one of '
+                    '`coming`, `busy`, `day_off`.',
+        parameters=[DISTRICT_SLUG_PARAM, RING_ID_PARAM],
+        responses={
+            200: OpenApiResponse(description='Ring status',
+                                 examples=[Examples.RING_STATUS_PENDING,
+                                           Examples.RING_STATUS_COMING]),
+        },
+    ),
+)
+class RingStatusAPIView(DistrictSlugURLKwargMixin, APIView):
     permission_classes = [permissions.AllowAny]
 
-    @extend_schema(
-        description="Check whether the employee has responded to a ring. Returns 'pending' or the response (coming, busy, day_off).",
-        responses={
-            200: {
-                'type': 'object',
-                'properties': {
-                    'ringId': {'type': 'string'},
-                    'status': {'type': 'string', 'enum': ['pending', 'coming', 'busy', 'day_off']},
-                    'responderName': {'type': 'string'},
-                }
-            }
-        },
-    )
-    def get(self, request, ringId):
+    def get(self, request, ringId, *args, **kwargs):
         entry = notifications.get_ring_response(ringId)
         if entry is None:
             return Response({'ringId': ringId, 'status': 'pending', 'responderName': ''})
@@ -329,433 +642,194 @@ class RingStatusAPIView(APIView):
         })
 
 
-class NotificationsStreamAPIView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+# ═════════════════════════════════════════════════════════════════════════
+#  KIOSK TRACKING (visits + service requests)
+# ═════════════════════════════════════════════════════════════════════════
 
-    @extend_schema(
-        description="Server-Sent Events stream for real-time notifications (new_message, ring_response, message_read events)",
-        responses={200: {'type': 'string', 'description': 'SSE event stream'}},
-    )
-    def get(self, request):
-        user_id = request.user.id
-        q = notifications.subscribe(user_id)
-
-        def event_stream():
-            try:
-                while True:
-                    try:
-                        ev = q.get(timeout=15)
-                    except Exception:
-                        # heartbeat to keep connection alive
-                        yield ':\n\n'
-                        continue
-                    if not ev:
-                        continue
-                    # SSE formatting
-                    ev_type = ev.get('type', 'message')
-                    data = json.dumps(ev)
-                    yield f'event: {ev_type}\n'
-                    yield f'data: {data}\n\n'
-            finally:
-                notifications.unsubscribe(user_id)
-
-        return StreamingHttpResponse(event_stream(), content_type='text/event-stream')
-
-
-def generate_password():
-    """Generate random 8-character password (letters + digits)"""
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-
-
-def send_sms(phone, message):
-    """
-    Send SMS to phone number
-    TODO: Integrate with SMS provider (Twilio, Uzbek telecom, etc.)
-    For now, prints to console
-    """
-    print(f"\n[SMS SENT] To: {phone}\nMessage: {message}\n")
-
-
-@method_decorator(staff_member_required, name='dispatch')
-class GeneratePasswordView(APIView):
-    """Generate new password for ApplicationTarget and display in admin"""
-    
-    def get(self, request, target_id):
-        try:
-            target = ApplicationTarget.objects.get(pk=target_id)
-        except ApplicationTarget.DoesNotExist:
-            return Response({'error': 'Target not found'}, status=status.HTTP_404_NOT_FOUND)
-        
-        # Generate new password
-        new_password = generate_password()
-        
-        # Update user password
-        if target.user:
-            target.user.set_password(new_password)
-            target.user.save()
-            
-            # Store the new password temporarily for display in admin
-            target.temp_password = new_password
-            target.save(update_fields=['temp_password'])
-            
-            # Show success message with the new password in admin panel
-            from django.contrib import messages as django_messages
-            django_messages.success(
-                request,
-                f'🔑 Yangi parol yaratildi!\n'
-                f'Login: {target.phone}\n'
-                f'Parol: {new_password}'
-            )
-            
-            # Redirect to target list
-            return redirect('/admin/api_v1/applicationtarget/')
-        
-        return Response({'error': 'User not found'}, status=status.HTTP_400_BAD_REQUEST)
-
-
-class DeviceViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet for managing FCM devices.
-    
-    - POST /api/v1/devices/ - Register a new device
-    - GET /api/v1/devices/ - List all devices for current user
-    - GET /api/v1/devices/<id>/ - Get device details
-    - PUT /api/v1/devices/<id>/ - Update device
-    - DELETE /api/v1/devices/<id>/ - Delete device
-    """
-    serializer_class = DeviceSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    
-    def get_queryset(self):
-        # Return only devices belonging to the current user
-        return Device.objects.filter(user=self.request.user)
-    
-    def perform_create(self, serializer):
-        # Automatically assign the current user as the device owner
-        serializer.save(user=self.request.user)
-    
-    @extend_schema(
-        summary='Register device',
-        description='Register a new FCM device token for push notifications',
-        request=DeviceSerializer,
-        responses={201: DeviceSerializer}
-    )
-    def create(self, request, *args, **kwargs):
-        return super().create(request, *args, **kwargs)
-    
-    @extend_schema(
-        summary='List devices',
-        description='List all registered devices for the authenticated user',
-        responses={200: DeviceSerializer(many=True)}
-    )
-    def list(self, request, *args, **kwargs):
-        return super().list(request, *args, **kwargs)
-    
-    @extend_schema(
-        summary='Get device',
-        description='Get details of a specific device',
-        responses={200: DeviceSerializer}
-    )
-    def retrieve(self, request, *args, **kwargs):
-        return super().retrieve(request, *args, **kwargs)
-    
-    @extend_schema(
-        summary='Update device',
-        description='Update device information (e.g., toggle active status)',
-        request=DeviceSerializer,
-        responses={200: DeviceSerializer}
-    )
-    def update(self, request, *args, **kwargs):
-        return super().update(request, *args, **kwargs)
-    
-    @extend_schema(
-        summary='Delete device',
-        description='Remove a device registration',
-        responses={204: None}
-    )
-    def destroy(self, request, *args, **kwargs):
-        return super().destroy(request, *args, **kwargs)
-
-
-class RegisterFcmTokenAPIView(APIView):
-    """Register or update an FCM token for the authenticated user."""
-    permission_classes = [permissions.IsAuthenticated]
-
-    @extend_schema(
-        description="Register FCM token for push notifications",
-        request={
-            'type': 'object',
-            'properties': {
-                'fcmToken': {'type': 'string', 'description': 'FCM registration token'},
-            },
-            'required': ['fcmToken'],
+@extend_schema_view(
+    post=extend_schema(
+        tags=[Tags.KIOSK],
+        summary='Register a kiosk visit',
+        description='Called by the kiosk when a new visitor session starts. '
+                    'Returns a `sessionId` to thread through subsequent '
+                    'service-request events.',
+        parameters=[DISTRICT_SLUG_PARAM],
+        request=KioskVisitRequest,
+        examples=[Examples.VISIT_BODY],
+        responses={
+            201: OpenApiResponse(description='Visit registered',
+                                 examples=[Examples.VISIT_CREATED]),
+            404: Responses.DISTRICT_NOT_FOUND,
         },
-        responses={200: {'type': 'object', 'properties': {'ok': {'type': 'boolean'}}}},
-    )
-    def post(self, request):
-        fcm_token = request.data.get('fcmToken')
-        if not fcm_token:
-            return Response(
-                {'detail': 'fcmToken is required'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+    ),
+)
+class KioskVisitAPIView(DistrictSlugURLKwargMixin, APIView):
+    permission_classes = [IsKioskOrDistrictAdmin]
 
-        Device.objects.update_or_create(
-            registration_id=fcm_token,
-            defaults={
-                'user': request.user,
-                'device_type': 'android',
-                'active': True,
-            },
-        )
-        return Response({'ok': True})
-
-
-class DeactivateFcmTokenAPIView(APIView):
-    """Deactivate an FCM token (called on logout)."""
-    permission_classes = [permissions.IsAuthenticated]
-
-    @extend_schema(
-        description="Deactivate FCM token on logout",
-        request={
-            'type': 'object',
-            'properties': {
-                'fcmToken': {'type': 'string'},
-            },
-            'required': ['fcmToken'],
-        },
-        responses={200: {'type': 'object', 'properties': {'ok': {'type': 'boolean'}}}},
-    )
-    def post(self, request):
-        fcm_token = request.data.get('fcmToken')
-        if not fcm_token:
-            return Response(
-                {'detail': 'fcmToken is required'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        Device.objects.filter(
-            registration_id=fcm_token,
-            user=request.user,
-        ).update(active=False)
-        return Response({'ok': True})
-
-
-# ── Kiosk Visit Tracking ──
-
-class KioskVisitAPIView(APIView):
-    """Track a new visitor session on the kiosk."""
-    permission_classes = [permissions.AllowAny]
-
-    @extend_schema(
-        description="Register a new kiosk visit session",
-        request={
-            'type': 'object',
-            'properties': {
-                'language': {'type': 'string', 'enum': ['uz', 'ru', 'en', 'kr']},
-            },
-        },
-        responses={201: {'type': 'object', 'properties': {'ok': {'type': 'boolean'}, 'sessionId': {'type': 'string'}}}},
-    )
-    def post(self, request):
+    def post(self, request, *args, **kwargs):
         language = request.data.get('language', 'uz')
         session_id = str(uuid.uuid4())
-        KioskVisit.objects.create(session_id=session_id, language=language)
-        return Response({'ok': True, 'sessionId': session_id}, status=status.HTTP_201_CREATED)
+        KioskVisit.objects.create(
+            district=request.district, session_id=session_id, language=language,
+        )
+        return Response({'ok': True, 'sessionId': session_id}, status=201)
 
 
-class ServiceRequestAPIView(APIView):
-    """Track when a visitor views a target profile on the kiosk."""
-    permission_classes = [permissions.AllowAny]
-
-    @extend_schema(
-        description="Track a service request (profile view) from the kiosk",
-        request={
-            'type': 'object',
-            'properties': {
-                'targetId': {'type': 'integer'},
-                'sessionId': {'type': 'string'},
-                'action': {'type': 'string', 'enum': ['view', 'ring', 'message']},
-            },
-            'required': ['targetId'],
+@extend_schema_view(
+    post=extend_schema(
+        tags=[Tags.KIOSK],
+        summary='Track a service request (view / ring / message)',
+        description='Records that a visitor `view`-ed, `ring`-ed, or '
+                    '`message`-d a target. Used to build top-N analytics.',
+        parameters=[DISTRICT_SLUG_PARAM],
+        request=ServiceRequestRequest,
+        examples=[Examples.SERVICE_REQUEST_BODY],
+        responses={
+            201: OpenApiResponse(description='Request recorded',
+                                 examples=[Examples.OK_TRUE]),
+            400: Responses.VALIDATION_ERROR,
+            404: OpenApiResponse(description='Target or district not found'),
         },
-        responses={201: {'type': 'object', 'properties': {'ok': {'type': 'boolean'}}}},
-    )
-    def post(self, request):
+    ),
+)
+class ServiceRequestAPIView(DistrictSlugURLKwargMixin, APIView):
+    permission_classes = [IsKioskOrDistrictAdmin]
+
+    def post(self, request, *args, **kwargs):
         target_id = request.data.get('targetId')
         session_id = request.data.get('sessionId')
         action = request.data.get('action', 'view')
 
         try:
-            target = ApplicationTarget.objects.get(pk=target_id)
+            target = ApplicationTarget.objects.get(pk=target_id, district=request.district)
         except ApplicationTarget.DoesNotExist:
-            return Response({'detail': 'Target not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Target not found'}, status=404)
 
         visit = None
         if session_id:
-            visit = KioskVisit.objects.filter(session_id=session_id).first()
+            visit = KioskVisit.objects.filter(
+                session_id=session_id, district=request.district,
+            ).first()
 
-        ServiceRequest.objects.create(target=target, visit=visit, action=action)
-        return Response({'ok': True}, status=status.HTTP_201_CREATED)
-
-
-# ── Analytics Endpoints ──
-
-from django.utils import timezone
-from django.db.models import Count, Q, F, Avg
-from django.db.models.functions import TruncDate, TruncHour
+        ServiceRequest.objects.create(
+            district=request.district, target=target, visit=visit, action=action,
+        )
+        return Response({'ok': True}, status=201)
 
 
-class AnalyticsMessagesAPIView(APIView):
-    """Message analytics: today, this week, this month counts + daily trend."""
-    permission_classes = [permissions.IsAdminUser]
+# ═════════════════════════════════════════════════════════════════════════
+#  ANALYTICS  (district admin only)
+# ═════════════════════════════════════════════════════════════════════════
 
-    @extend_schema(
-        description="Get message analytics: totals for today/week/month and daily breakdown",
-        responses={200: {
-            'type': 'object',
-            'properties': {
-                'today': {'type': 'integer'},
-                'thisWeek': {'type': 'integer'},
-                'thisMonth': {'type': 'integer'},
-                'daily': {'type': 'array', 'items': {
-                    'type': 'object',
-                    'properties': {
-                        'date': {'type': 'string'},
-                        'count': {'type': 'integer'},
-                    }
-                }},
-            }
-        }},
-    )
-    def get(self, request):
+class _DistrictAnalyticsBase(DistrictSlugURLKwargMixin, APIView):
+    permission_classes = [IsDistrictAdmin]
+
+
+@extend_schema_view(
+    get=extend_schema(
+        tags=[Tags.ANALYTICS],
+        summary='Message volume — today / week / month + 30-day trend',
+        description='Aggregated counts of incoming messages for this district.',
+        parameters=[DISTRICT_SLUG_PARAM],
+        responses={
+            200: OpenApiResponse(description='Aggregated counts',
+                                 examples=[Examples.ANALYTICS_MESSAGES]),
+            401: Responses.UNAUTHORIZED,
+            403: Responses.FORBIDDEN_DISTRICT,
+        },
+    ),
+)
+class AnalyticsMessagesAPIView(_DistrictAnalyticsBase):
+    def get(self, request, *args, **kwargs):
         now = timezone.now()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         week_start = today_start - timezone.timedelta(days=now.weekday())
         month_start = today_start.replace(day=1)
-
-        today_count = Message.objects.filter(timestamp__gte=today_start).count()
-        week_count = Message.objects.filter(timestamp__gte=week_start).count()
-        month_count = Message.objects.filter(timestamp__gte=month_start).count()
-
-        # Daily breakdown for last 30 days
         thirty_days_ago = today_start - timezone.timedelta(days=30)
+
+        base = Message.objects.filter(district=request.district)
         daily = (
-            Message.objects
-            .filter(timestamp__gte=thirty_days_ago)
+            base.filter(timestamp__gte=thirty_days_ago)
             .annotate(date=TruncDate('timestamp'))
             .values('date')
             .annotate(count=Count('id'))
             .order_by('date')
         )
-
         return Response({
-            'today': today_count,
-            'thisWeek': week_count,
-            'thisMonth': month_count,
+            'today': base.filter(timestamp__gte=today_start).count(),
+            'thisWeek': base.filter(timestamp__gte=week_start).count(),
+            'thisMonth': base.filter(timestamp__gte=month_start).count(),
             'daily': [{'date': str(d['date']), 'count': d['count']} for d in daily],
         })
 
 
-class AnalyticsVisitorsAPIView(APIView):
-    """Visitor analytics: today, this week, this month counts + daily trend."""
-    permission_classes = [permissions.IsAdminUser]
-
-    @extend_schema(
-        description="Get visitor analytics: totals for today/week/month, daily breakdown, and language distribution",
-        responses={200: {
-            'type': 'object',
-            'properties': {
-                'today': {'type': 'integer'},
-                'thisWeek': {'type': 'integer'},
-                'thisMonth': {'type': 'integer'},
-                'daily': {'type': 'array', 'items': {
-                    'type': 'object',
-                    'properties': {
-                        'date': {'type': 'string'},
-                        'count': {'type': 'integer'},
-                    }
-                }},
-                'byLanguage': {'type': 'object'},
-            }
-        }},
-    )
-    def get(self, request):
+@extend_schema_view(
+    get=extend_schema(
+        tags=[Tags.ANALYTICS],
+        summary='Visitor counts + language breakdown',
+        description='Aggregated kiosk visit metrics for this district.',
+        parameters=[DISTRICT_SLUG_PARAM],
+        responses={
+            200: OpenApiResponse(description='Visitor analytics',
+                                 examples=[Examples.ANALYTICS_VISITORS]),
+            401: Responses.UNAUTHORIZED,
+            403: Responses.FORBIDDEN_DISTRICT,
+        },
+    ),
+)
+class AnalyticsVisitorsAPIView(_DistrictAnalyticsBase):
+    def get(self, request, *args, **kwargs):
         now = timezone.now()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         week_start = today_start - timezone.timedelta(days=now.weekday())
         month_start = today_start.replace(day=1)
-
-        today_count = KioskVisit.objects.filter(created_at__gte=today_start).count()
-        week_count = KioskVisit.objects.filter(created_at__gte=week_start).count()
-        month_count = KioskVisit.objects.filter(created_at__gte=month_start).count()
-
-        # Daily breakdown for last 30 days
         thirty_days_ago = today_start - timezone.timedelta(days=30)
+
+        base = KioskVisit.objects.filter(district=request.district)
         daily = (
-            KioskVisit.objects
-            .filter(created_at__gte=thirty_days_ago)
+            base.filter(created_at__gte=thirty_days_ago)
             .annotate(date=TruncDate('created_at'))
             .values('date')
             .annotate(count=Count('id'))
             .order_by('date')
         )
-
-        # Language distribution this month
         by_language = dict(
-            KioskVisit.objects
-            .filter(created_at__gte=month_start)
+            base.filter(created_at__gte=month_start)
             .values_list('language')
             .annotate(count=Count('id'))
             .values_list('language', 'count')
         )
-
         return Response({
-            'today': today_count,
-            'thisWeek': week_count,
-            'thisMonth': month_count,
+            'today': base.filter(created_at__gte=today_start).count(),
+            'thisWeek': base.filter(created_at__gte=week_start).count(),
+            'thisMonth': base.filter(created_at__gte=month_start).count(),
             'daily': [{'date': str(d['date']), 'count': d['count']} for d in daily],
             'byLanguage': by_language,
         })
 
 
-class AnalyticsMostRingedAPIView(APIView):
-    """Top 10 most ringed employees."""
-    permission_classes = [permissions.IsAdminUser]
-
-    @extend_schema(
-        description="Get top 10 most ringed employees with ring counts and response breakdown",
-        parameters=[
-            {
-                'name': 'period',
-                'in': 'query',
-                'description': 'Period: today, week, month, all',
-                'schema': {'type': 'string', 'enum': ['today', 'week', 'month', 'all']},
-            }
-        ],
-        responses={200: {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'properties': {
-                    'targetId': {'type': 'integer'},
-                    'name': {'type': 'string'},
-                    'position': {'type': 'string'},
-                    'agency': {'type': 'string'},
-                    'totalRings': {'type': 'integer'},
-                    'coming': {'type': 'integer'},
-                    'busy': {'type': 'integer'},
-                    'dayOff': {'type': 'integer'},
-                    'noResponse': {'type': 'integer'},
-                }
-            }
-        }},
-    )
-    def get(self, request):
+@extend_schema_view(
+    get=extend_schema(
+        tags=[Tags.ANALYTICS],
+        summary='Top 10 most-ringed targets',
+        description='Returns the 10 targets with the most ring events in the '
+                    'requested period, with response breakdown.',
+        parameters=[DISTRICT_SLUG_PARAM, PERIOD_PARAM, LANG_PARAM],
+        responses={
+            200: OpenApiResponse(description='Top 10',
+                                 examples=[Examples.ANALYTICS_TOP_RINGED]),
+            401: Responses.UNAUTHORIZED,
+            403: Responses.FORBIDDEN_DISTRICT,
+        },
+    ),
+)
+class AnalyticsMostRingedAPIView(_DistrictAnalyticsBase):
+    def get(self, request, *args, **kwargs):
         now = timezone.now()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         period = request.query_params.get('period', 'month')
 
-        qs = Ring.objects.all()
+        qs = Ring.objects.filter(district=request.district)
         if period == 'today':
             qs = qs.filter(created_at__gte=today_start)
         elif period == 'week':
@@ -764,12 +838,11 @@ class AnalyticsMostRingedAPIView(APIView):
             qs = qs.filter(created_at__gte=today_start.replace(day=1))
 
         lang = request.query_params.get('lang', 'uz')
-        if lang not in ('uz', 'ru', 'en', 'kr'):
+        if lang not in ('uz', 'ru', 'en', 'kk', 'kir'):
             lang = 'uz'
 
         top = (
-            qs
-            .values('target')
+            qs.values('target')
             .annotate(
                 total=Count('id'),
                 coming=Count('id', filter=Q(response='coming')),
@@ -783,7 +856,7 @@ class AnalyticsMostRingedAPIView(APIView):
         results = []
         for entry in top:
             try:
-                t = ApplicationTarget.objects.get(pk=entry['target'])
+                t = ApplicationTarget.objects.get(pk=entry['target'], district=request.district)
                 results.append({
                     'targetId': t.id,
                     'name': t.user.get_full_name() or t.phone,
@@ -797,47 +870,31 @@ class AnalyticsMostRingedAPIView(APIView):
                 })
             except ApplicationTarget.DoesNotExist:
                 continue
-
         return Response(results)
 
 
-class AnalyticsMostRequestedAPIView(APIView):
-    """Top 10 most requested services/employees."""
-    permission_classes = [permissions.IsAdminUser]
-
-    @extend_schema(
-        description="Get top 10 most requested services (targets) with action breakdown",
-        parameters=[
-            {
-                'name': 'period',
-                'in': 'query',
-                'description': 'Period: today, week, month, all',
-                'schema': {'type': 'string', 'enum': ['today', 'week', 'month', 'all']},
-            }
-        ],
-        responses={200: {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'properties': {
-                    'targetId': {'type': 'integer'},
-                    'name': {'type': 'string'},
-                    'position': {'type': 'string'},
-                    'agency': {'type': 'string'},
-                    'totalRequests': {'type': 'integer'},
-                    'views': {'type': 'integer'},
-                    'rings': {'type': 'integer'},
-                    'messages': {'type': 'integer'},
-                }
-            }
-        }},
-    )
-    def get(self, request):
+@extend_schema_view(
+    get=extend_schema(
+        tags=[Tags.ANALYTICS],
+        summary='Top 10 most-requested targets',
+        description='Returns the 10 targets with the most service-request '
+                    'events in the period, broken down by action type.',
+        parameters=[DISTRICT_SLUG_PARAM, PERIOD_PARAM, LANG_PARAM],
+        responses={
+            200: OpenApiResponse(description='Top 10',
+                                 examples=[Examples.ANALYTICS_TOP_REQUESTED]),
+            401: Responses.UNAUTHORIZED,
+            403: Responses.FORBIDDEN_DISTRICT,
+        },
+    ),
+)
+class AnalyticsMostRequestedAPIView(_DistrictAnalyticsBase):
+    def get(self, request, *args, **kwargs):
         now = timezone.now()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         period = request.query_params.get('period', 'month')
 
-        qs = ServiceRequest.objects.all()
+        qs = ServiceRequest.objects.filter(district=request.district)
         if period == 'today':
             qs = qs.filter(created_at__gte=today_start)
         elif period == 'week':
@@ -846,12 +903,11 @@ class AnalyticsMostRequestedAPIView(APIView):
             qs = qs.filter(created_at__gte=today_start.replace(day=1))
 
         lang = request.query_params.get('lang', 'uz')
-        if lang not in ('uz', 'ru', 'en', 'kr'):
+        if lang not in ('uz', 'ru', 'en', 'kk', 'kir'):
             lang = 'uz'
 
         top = (
-            qs
-            .values('target')
+            qs.values('target')
             .annotate(
                 total=Count('id'),
                 views=Count('id', filter=Q(action='view')),
@@ -864,7 +920,7 @@ class AnalyticsMostRequestedAPIView(APIView):
         results = []
         for entry in top:
             try:
-                t = ApplicationTarget.objects.get(pk=entry['target'])
+                t = ApplicationTarget.objects.get(pk=entry['target'], district=request.district)
                 results.append({
                     'targetId': t.id,
                     'name': t.user.get_full_name() or t.phone,
@@ -877,5 +933,157 @@ class AnalyticsMostRequestedAPIView(APIView):
                 })
             except ApplicationTarget.DoesNotExist:
                 continue
-
         return Response(results)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  DEVICES  (FCM)
+# ═════════════════════════════════════════════════════════════════════════
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=[Tags.DEVICES],
+        summary='List my registered devices',
+        parameters=[DISTRICT_SLUG_PARAM],
+        responses={
+            200: OpenApiResponse(response=DeviceSerializer(many=True),
+                                 description='Device list',
+                                 examples=[Examples.DEVICE_LIST]),
+            401: Responses.UNAUTHORIZED,
+        },
+    ),
+    create=extend_schema(
+        tags=[Tags.DEVICES],
+        summary='Register a device',
+        description='Idempotent — registering an existing `registration_id` updates it.',
+        parameters=[DISTRICT_SLUG_PARAM],
+        request=DeviceSerializer,
+        responses={
+            201: DeviceSerializer,
+            400: Responses.VALIDATION_ERROR,
+            401: Responses.UNAUTHORIZED,
+        },
+    ),
+    retrieve=extend_schema(
+        tags=[Tags.DEVICES],
+        summary='Get a device',
+        parameters=[DISTRICT_SLUG_PARAM],
+        responses={200: DeviceSerializer, 404: Responses.NOT_FOUND},
+    ),
+    update=extend_schema(
+        tags=[Tags.DEVICES],
+        summary='Update a device',
+        parameters=[DISTRICT_SLUG_PARAM],
+        request=DeviceSerializer,
+        responses={200: DeviceSerializer},
+    ),
+    partial_update=extend_schema(
+        tags=[Tags.DEVICES],
+        summary='Partially update a device',
+        parameters=[DISTRICT_SLUG_PARAM],
+        request=DeviceSerializer,
+        responses={200: DeviceSerializer},
+    ),
+    destroy=extend_schema(
+        tags=[Tags.DEVICES],
+        summary='Delete a device',
+        parameters=[DISTRICT_SLUG_PARAM],
+        responses={204: None, 404: Responses.NOT_FOUND},
+    ),
+)
+class DeviceViewSet(DistrictSlugURLKwargMixin, viewsets.ModelViewSet):
+    serializer_class = DeviceSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Device.objects.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  REALTIME (SSE)
+# ═════════════════════════════════════════════════════════════════════════
+
+@extend_schema_view(
+    get=extend_schema(
+        tags=[Tags.REALTIME],
+        summary='Server-Sent Events stream',
+        description=(
+            'Long-lived `text/event-stream` connection. Events emitted:\n\n'
+            '* `new_message` — new message addressed to the user\n'
+            '* `ring` — incoming ring\n'
+            '* `ring_response` — somebody responded to a ring\n'
+            '* `message_read` — a message was marked read\n\n'
+            "Note: Swagger UI cannot fully test SSE — use a browser or "
+            "`curl -N`."
+        ),
+        responses={
+            200: OpenApiResponse(description='text/event-stream'),
+            401: Responses.UNAUTHORIZED,
+        },
+    ),
+)
+class NotificationsStreamAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user_id = request.user.id
+        q = notifications.subscribe(user_id)
+
+        def event_stream():
+            try:
+                while True:
+                    try:
+                        ev = q.get(timeout=15)
+                    except Exception:
+                        yield ':\n\n'
+                        continue
+                    if not ev:
+                        continue
+                    ev_type = ev.get('type', 'message')
+                    yield f'event: {ev_type}\n'
+                    yield f'data: {json.dumps(ev)}\n\n'
+            finally:
+                notifications.unsubscribe(user_id)
+
+        return StreamingHttpResponse(event_stream(), content_type='text/event-stream')
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  ADMIN-ONLY (excluded from Swagger)
+# ═════════════════════════════════════════════════════════════════════════
+
+def _generate_password():
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+
+
+@extend_schema(exclude=True)
+@method_decorator(staff_member_required, name='dispatch')
+class GeneratePasswordView(APIView):
+    """Admin redirect endpoint — excluded from the public schema."""
+
+    def get(self, request, target_id):
+        try:
+            target = ApplicationTarget.objects.get(pk=target_id)
+        except ApplicationTarget.DoesNotExist:
+            return Response({'error': 'Target not found'}, status=404)
+
+        profile = getattr(request.user, 'district_admin', None)
+        if not request.user.is_superuser and profile and target.district_id != profile.district_id:
+            return Response({'error': 'Forbidden'}, status=403)
+
+        new_password = _generate_password()
+        if target.user:
+            target.user.set_password(new_password)
+            target.user.save()
+            target.temp_password = new_password
+            target.save(update_fields=['temp_password'])
+            from django.contrib import messages as django_messages
+            django_messages.success(
+                request,
+                f'🔑 Yangi parol yaratildi!\nLogin: {target.phone}\nParol: {new_password}',
+            )
+            return redirect('/admin/api_v1/applicationtarget/')
+        return Response({'error': 'User not found'}, status=400)

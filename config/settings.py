@@ -55,6 +55,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'api_v1.middleware.DistrictResolverMiddleware',
 ]
 CORS_ALLOW_ALL_ORIGINS = True
 
@@ -147,11 +148,52 @@ SIMPLE_JWT = {
     'BLACKLIST_AFTER_ROTATION': False,
 }
 
-# drf-spectacular settings
+# drf-spectacular settings (Swagger UI)
+# Tag definitions are imported from api_v1.swagger to keep names in one place.
+def _build_spectacular_tags():
+    from api_v1.swagger import TAG_DEFS
+    return TAG_DEFS
+
+
 SPECTACULAR_SETTINGS = {
-    'TITLE': 'Kiosk Backend API',
-    'DESCRIPTION': 'API documentation for kiosk backend',
-    'VERSION': '1.0.0',
+    'TITLE': 'Kiosk Backend API (Multi-District)',
+    'DESCRIPTION': (
+        '## Multi-tenant kiosk backend\n\n'
+        'Every endpoint under `/api/v1/` is **scoped by `<district_slug>`** '
+        '(e.g. `/api/v1/oltiariq/messages/`). The slug must match an active '
+        'district in the database; unknown slugs return 404.\n\n'
+        '### Authentication\n'
+        '1. Call **`POST /api/auth/login`** with phone + password.\n'
+        '2. Copy the `access` token from the response.\n'
+        '3. Click **Authorize** (top-right) and paste `Bearer <access>`.\n'
+        '4. Every subsequent request will be authenticated.\n\n'
+        '### Roles\n'
+        '* **Super Admin** — Django superuser. Manage districts at '
+        '`/api/superadmin/`.\n'
+        '* **District Admin** — User with a `DistrictAdminProfile`. Sees only '
+        'their district.\n'
+        '* **Anonymous (kiosk)** — Public endpoints, still URL-scoped.\n\n'
+        '### File uploads\n'
+        '`POST /api/v1/<slug>/messages/create/` accepts `multipart/form-data` '
+        'so audio/video can be uploaded directly from this Swagger UI.'
+    ),
+    'VERSION': '2.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'COMPONENT_SPLIT_REQUEST': True,
+    'SCHEMA_PATH_PREFIX': r'/api/',
+    'SORT_OPERATIONS': False,
+    'SWAGGER_UI_SETTINGS': {
+        'persistAuthorization': True,
+        'displayOperationId': False,
+        'filter': True,
+        'tagsSorter': 'alpha',
+        'docExpansion': 'none',
+        'defaultModelsExpandDepth': 1,
+        'defaultModelExpandDepth': 2,
+        'tryItOutEnabled': True,
+        'syntaxHighlight.theme': 'monokai',
+    },
+    'TAGS': _build_spectacular_tags(),
 }
 
 # Media fayllar (Rasm yuklash uchun)

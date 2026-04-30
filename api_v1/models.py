@@ -3,6 +3,50 @@ from django.contrib.auth.models import User # Standart user
 import re
 
 
+class District(models.Model):
+    """A tenant (tuman). Every kiosk-facing record belongs to exactly one district."""
+    name = models.CharField(max_length=120, verbose_name='Tuman nomi')
+    slug = models.SlugField(
+        max_length=60, unique=True, db_index=True,
+        verbose_name='Slug',
+        help_text="URL identifier, e.g. 'oltiariq', 'boz'",
+    )
+    is_active = models.BooleanField(default=True, verbose_name='Faol')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Yaratilgan vaqti')
+
+    class Meta:
+        verbose_name = 'Tuman'
+        verbose_name_plural = 'Tumanlar'
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
+class DistrictAdminProfile(models.Model):
+    """Marks a User as the admin of one specific District.
+
+    Super Admins are Django superusers (is_superuser=True) and have NO profile —
+    they get cross-district access.
+    """
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name='district_admin',
+        verbose_name='Foydalanuvchi',
+    )
+    district = models.ForeignKey(
+        District, on_delete=models.CASCADE, related_name='admins',
+        verbose_name='Tuman',
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Yaratilgan vaqti')
+
+    class Meta:
+        verbose_name = 'Tuman admini'
+        verbose_name_plural = 'Tuman adminlari'
+
+    def __str__(self):
+        return f"{self.user.username} → {self.district.slug}"
+
+
 class Device(models.Model):
     """Model for storing FCM device tokens for push notifications"""
     
@@ -79,9 +123,15 @@ class ApplicationTarget(models.Model):
         SHIFT_2 = '2-smena', '2-smena (Kechki)'
         CUSTOM = 'Maxsus', 'Maxsus jadval'
 
+    # Tuman (multi-tenant scoping)
+    district = models.ForeignKey(
+        District, on_delete=models.CASCADE, related_name='targets',
+        verbose_name='Tuman',
+    )
+
     # Hodimning shaxsiy useri (Login uchun)
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile', verbose_name='Foydalanuvchi')
-    
+
     # Hodimning telefon raqami (Login sifatida ishlatiladi)
     phone = models.CharField(max_length=20, unique=True, verbose_name='Telefon raqami')
     target_type = models.CharField(max_length=15, choices=Type.choices, verbose_name='Turi')
@@ -168,6 +218,10 @@ class Ring(models.Model):
         DAY_OFF = 'day_off', 'Day off'
 
     ring_id = models.CharField(max_length=64, unique=True, verbose_name='Ring ID')
+    district = models.ForeignKey(
+        District, on_delete=models.CASCADE, related_name='rings',
+        verbose_name='Tuman',
+    )
     target = models.ForeignKey(ApplicationTarget, on_delete=models.CASCADE, related_name='rings', verbose_name='Target')
     caller_name = models.CharField(max_length=255, default='Visitor', verbose_name='Caller name')
     response = models.CharField(max_length=10, choices=ResponseChoice.choices, blank=True, verbose_name='Response')
@@ -180,6 +234,10 @@ class Ring(models.Model):
 
 class KioskVisit(models.Model):
     """Tracks each visitor session on the kiosk."""
+    district = models.ForeignKey(
+        District, on_delete=models.CASCADE, related_name='visits',
+        verbose_name='Tuman',
+    )
     session_id = models.CharField(max_length=64, unique=True, verbose_name='Session ID')
     language = models.CharField(max_length=5, default='uz', verbose_name='Language')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Visit time')
@@ -190,6 +248,10 @@ class KioskVisit(models.Model):
 
 class ServiceRequest(models.Model):
     """Tracks which target/service a visitor looked at or interacted with."""
+    district = models.ForeignKey(
+        District, on_delete=models.CASCADE, related_name='service_requests',
+        verbose_name='Tuman',
+    )
     target = models.ForeignKey(ApplicationTarget, on_delete=models.CASCADE, related_name='service_requests', verbose_name='Target')
     visit = models.ForeignKey(KioskVisit, on_delete=models.SET_NULL, null=True, blank=True, related_name='service_requests')
     action = models.CharField(max_length=20, default='view', verbose_name='Action')  # view, ring, message
@@ -205,6 +267,11 @@ class Message(models.Model):
         AUDIO = 'audio', 'Audio'
         VIDEO = 'video', 'Video'
 
+    # Tuman (multi-tenant scoping)
+    district = models.ForeignKey(
+        District, on_delete=models.CASCADE, related_name='messages',
+        verbose_name='Tuman',
+    )
     # target is the recipient user
     target = models.ForeignKey('auth.User', on_delete=models.CASCADE, related_name='messages', verbose_name='Qabul qiluvchi')
     sender_name = models.CharField(max_length=255, verbose_name='Yuboruvchi ismi')
